@@ -167,6 +167,45 @@ async function validOperationalAssignment(bus, routeId, session) {
   return shift ? driver : null;
 }
 
+async function bookingReadinessMessage(routeId, session, onlyBus = null) {
+  const buses = onlyBus ? [onlyBus] : await Bus.find({ route: routeId }).session(session);
+  if (!buses.length) return 'No bus has been assigned to this route yet. Contact the transit team to assign a bus.';
+
+  const withSeats = buses.filter((bus) => Number(bus.availableSeats) > 0);
+  if (!withSeats.length) return 'All buses assigned to this route are full. Please try again later or choose another route.';
+
+  const serviceable = withSeats.filter((bus) => bus.status !== 'maintenance');
+  if (!serviceable.length) return 'The assigned bus is under maintenance and cannot be booked right now.';
+
+  let hasAssignedDriver = false;
+  let hasActiveShift = false;
+  for (const bus of serviceable) {
+    if (!bus.driver) continue;
+    const driver = await User.findOne({
+      _id: bus.driver,
+      role: 'driver',
+      assignedBus: bus._id,
+    }).select('_id').session(session);
+    if (!driver) continue;
+    hasAssignedDriver = true;
+
+    const shift = await Shift.findOne({
+      driver: driver._id,
+      bus: bus._id,
+      route: routeId,
+      status: 'active',
+    }).select('_id').session(session);
+    if (shift) {
+      hasActiveShift = true;
+      if (bus.status === 'active') return 'The active shift and bus assignment could not be matched. Refresh and retry; if it continues, ask the administrator to verify the route assignment.';
+    }
+  }
+
+  if (!hasAssignedDriver) return 'A bus is assigned to this route, but it has no valid driver assignment. Ask the administrator to assign a driver.';
+  if (!hasActiveShift) return 'A bus and driver are assigned, but the driver has not started a shift. Ask the driver to start their shift, then try booking again.';
+  return 'The driver shift is active, but the bus is not marked as operating. Ask the administrator to check the bus status.';
+}
+
 async function resolveBookingAssignment(values, session) {
   let bus = null;
   let routeId = values.routeId;
@@ -201,13 +240,13 @@ async function resolveBookingAssignment(values, session) {
       }
     }
     if (!bus) {
-      throw new ApiError(409, 'No active assigned bus is currently available for this route.');
+      throw new ApiError(409, await bookingReadinessMessage(route._id, session));
     }
   }
 
   const driver = await validOperationalAssignment(bus, route._id, session);
   if (!driver) {
-    throw new ApiError(409, 'The selected bus does not have a valid active driver shift for this route.');
+    throw new ApiError(409, await bookingReadinessMessage(route._id, session, bus));
   }
   if (values.driverId && !sameId(driver._id, values.driverId)) {
     throw new ApiError(400, 'The selected driver is not assigned to this bus and route.');

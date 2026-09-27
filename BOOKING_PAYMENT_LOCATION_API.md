@@ -10,6 +10,10 @@ Route details -> POST /api/bookings with routeId -> backend resolves bus and dri
 
 The backend accepts only an active route with at least one stop. It considers buses on that route that are active, have seats, have an assigned driver, and have a matching active shift. When more than one bus is eligible, resolution is deterministic:
 
+An admin assigning a bus and driver does not start service. The assigned driver must start a shift from the Driver workspace before passengers can reserve seats. The passenger booking screen refreshes bus availability while open and explains when no bus/driver is assigned, the shift has not started, the bus is under maintenance, or all seats are full. A `409` response includes the specific readiness reason.
+
+`GET /api/buses` includes `shiftActive` for each bus. It is true only when an active shift matches that bus, driver, and route; clients should use it with `status` and `availableSeats` to display booking availability. The booking endpoint validates the assignment again when reserving the seat.
+
 1. Most recent `lastLocationUpdate`
 2. `busNumber` ascending
 3. Bus `_id` ascending
