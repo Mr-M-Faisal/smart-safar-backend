@@ -4,12 +4,11 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "node --test --test-concurrency=1 test/driver-management.test.js",
-    "dev": "nodemon src/server.js",
-    "start": "node src/server.js"
-  },
-  "engines": {
-    "node": ">=18.0.0"
+    "test": "node --test --test-concurrency=1 test/driver-management.test.js test/operating-bus-rules.test.js",
+    "test:unit": "node test/operating-bus-rules.test.js",
+    "reconcile:operating-buses": "node src/scripts/reconcileOperatingBuses.js",
+    "reconcile:operating-buses:apply": "node src/scripts/reconcileOperatingBuses.js --apply",
+    "dev": "nodemon src/server.js"
   },
   "keywords": [],
   "author": "",

@@ -1,18 +1,14 @@
 const Bus = require('../models/Bus');
 const Stop = require('../models/Stop');
 const Shift = require('../models/Shift');
+const User = require('../models/User');
 const { createFleetBus, updateFleetBus, deleteFleetBus } = require('../services/busAssignmentService');
 const { sendApiError } = require('../utils/apiError');
 const { haversineDistanceKm } = require('../utils/geo');
-
-const emitSeatAvailability = (req, bus) => {
-  if (!bus) return;
-  req.app.get('io').to(`bus:${bus._id}`).emit('seatAvailabilityUpdate', {
-    busId: bus._id,
-    availableSeats: bus.availableSeats,
-    capacity: bus.capacity,
-  });
-};
+const { getOperatingBusesForRoute, getOperatingBusForDriver } = require('../services/operatingBusService');
+const Seat = require('../models/Seat');
+const Booking = require('../models/Booking');
+const { runInTransaction } = require('../services/transactionService');
 
 // How close (in km) the bus must get to a stop before we consider it
 // "reached" and advance to the next one. ~50 meters.
@@ -108,7 +104,7 @@ const startReturnTrip = async (req, res) => {
     if (!bus) return res.status(404).json({ message: 'Assigned bus not found.' });
     if (!sameId(bus.driver, req.user._id)) return res.status(403).json({ message: 'Forbidden: this bus is not assigned to you.' });
     if (!bus.route) return res.status(400).json({ message: 'No route assigned.' });
-    if (!await Shift.exists({ driver: req.user._id, bus: bus._id, status: 'active' })) {
+    if (!await getOperatingBusForDriver(req.user._id)) {
       return res.status(409).json({ message: 'Start an active shift before starting a return trip.' });
     }
     if (getBusDirection(bus) === 'return') return res.status(409).json({ message: 'Return trip has already started.' });
@@ -142,7 +138,7 @@ const startReturnTrip = async (req, res) => {
     req.app.get('io').to(`bus:${updated._id}`).emit('locationUpdate', payload);
     res.status(200).json({ ...updated.toObject(), ...etaInfo });
   } catch (err) {
-    res.status(500).json({ message: 'Server error starting return trip', error: err.message });
+    sendApiError(res, err, 'Could not start the return trip.');
   }
 };
 
@@ -166,10 +162,25 @@ const getBuses = async (req, res) => {
       .populate('route', 'routeName')
       .populate('driver', 'name phone');
 
-    res.status(200).json(buses);
+    const busIds = buses.map((bus) => bus._id);
+    const routeIds = [...new Set(buses.map(bus => bus.route?._id || bus.route).filter(Boolean).map(String))];
+    const operating = (await Promise.all(routeIds.map(id => getOperatingBusesForRoute(id)))).flat();
+    const operatingById = new Map(operating.map(bus => [String(bus._id), bus]));
+    res.status(200).json(buses.map(bus => {
+      const active = operatingById.get(String(bus._id));
+      return { ...bus.toObject(), status: active ? 'active' : bus.status === 'maintenance' ? 'maintenance' : 'idle', shiftActive: Boolean(active), operating: Boolean(active), shiftId: active?.shiftId || null, availableSeats: active?.availableSeats ?? null };
+    }));
   } catch (err) {
-    res.status(500).json({ message: 'Server error fetching buses', error: err.message });
+    sendApiError(res, err, 'Could not load buses.');
   }
+};
+
+const getActiveBusesForRoute = async (req, res) => {
+  try {
+    const buses = await getOperatingBusesForRoute(req.params.routeId);
+    const results = await Promise.all(buses.map(async bus => ({ ...bus, ...(await calculateNextStopAndETA(bus)) })));
+    res.status(200).json(results);
+  } catch (error) { sendApiError(res, error, 'Could not load operating buses.'); }
 };
 
 // @route   GET /api/buses/:id
@@ -182,10 +193,82 @@ const getBusById = async (req, res) => {
     if (!bus) {
       return res.status(404).json({ message: 'Bus not found' });
     }
-    res.status(200).json(bus);
+    const operatingBus = bus.driver ? await getOperatingBusForDriver(bus.driver._id || bus.driver) : null;
+    const operating = String(operatingBus?._id || '') === String(bus._id);
+    res.status(200).json({ ...bus.toObject(), status: operating ? 'active' : bus.status === 'maintenance' ? 'maintenance' : 'idle', operating, shift: operatingBus?.shiftId || null, availableSeats: operatingBus?.availableSeats ?? null });
   } catch (err) {
-    res.status(500).json({ message: 'Server error fetching bus', error: err.message });
+    sendApiError(res, err, 'Could not load this bus.');
   }
+};
+
+const getBusSeats = async (req,res) => {
+  try {
+    const bus=await Bus.findById(req.params.id);
+    if(!bus) return res.status(404).json({message:'Bus not found.',code:'BUS_NOT_FOUND'});
+    const operating=bus.driver?await getOperatingBusForDriver(bus.driver):null;
+    if(!operating||String(operating._id)!==String(bus._id)) return res.status(409).json({message:'This bus has no open driver shift.',code:'SHIFT_NOT_OPEN'});
+    const seats=(await Seat.find({shift:operating.shiftId}).select('seatNumber status updatedAt').lean()).sort((a,b)=>Number(a.seatNumber)-Number(b.seatNumber));
+    res.json({busId:bus._id,shiftId:operating.shiftId,seats,capacity:bus.capacity,available:seats.filter(s=>s.status==='available').length,reserved:seats.filter(s=>s.status==='reserved').length,occupied:seats.filter(s=>s.status==='occupied').length});
+  } catch(error){sendApiError(res,error,'Could not load seat map.');}
+};
+
+const getAssignedDriverSeats = async (req,res) => {
+  try {
+    const bus=await getOperatingBusForDriver(req.user._id);
+    if(!bus) return res.status(409).json({message:'Start your assigned bus shift before managing seats.',code:'SHIFT_NOT_OPEN'});
+    const seats=(await Seat.find({shift:bus.shiftId}).populate({path:'booking',select:'user locationSharingActive',populate:{path:'user',select:'name'}}).lean()).sort((a,b)=>Number(a.seatNumber)-Number(b.seatNumber));
+    const safe=seats.map(s=>({seatNumber:s.seatNumber,status:s.status,bookingId:s.booking?._id||null,passengerName:s.booking?.user?.name?.split(' ')[0]||null,shareLocation:Boolean(s.booking?.locationSharingActive)}));
+    res.json({busId:bus._id,busNumber:bus.busNumber,shiftId:bus.shiftId,seats:safe,capacity:bus.capacity,available:safe.filter(s=>s.status==='available').length,reserved:safe.filter(s=>s.status==='reserved').length,occupied:safe.filter(s=>s.status==='occupied').length});
+  } catch(error){sendApiError(res,error,'Could not load driver seat map.');}
+};
+
+const emitSeatState = async (req,bus) => {
+  const seats=(await Seat.find({shift:bus.shiftId}).select('seatNumber status updatedAt').lean()).sort((a,b)=>Number(a.seatNumber)-Number(b.seatNumber));
+  const payload={busId:bus._id,shiftId:bus.shiftId,seats,capacity:bus.capacity,available:seats.filter(s=>s.status==='available').length,reserved:seats.filter(s=>s.status==='reserved').length,occupied:seats.filter(s=>s.status==='occupied').length};
+  req.app.get('io')?.to(`bus:${bus._id}`).emit('seatStateUpdate',payload);
+  req.app.get('io')?.to(`driver:${bus.driver?._id||bus.driver}`).emit('driverSeatStateUpdate',payload);
+};
+
+const updateAssignedSeat = async(req,res) => {
+  try {
+    const {action}=req.body||{};
+    if(!['board','no_show','occupy','release'].includes(action)) return res.status(400).json({message:'Choose a valid seat action.',code:'INVALID_SEAT_ACTION'});
+    const bus=await getOperatingBusForDriver(req.user._id);
+    if(!bus) return res.status(409).json({message:'Only your own bus with an open shift can be managed.',code:'SHIFT_NOT_OPEN'});
+    const seatNumber=String(req.params.seatNumber||'').trim();
+    const seat=await Seat.findOne({bus:bus._id,shift:bus.shiftId,seatNumber});
+    if(!seat) return res.status(404).json({message:'Seat number is not part of this bus shift.',code:'SEAT_NOT_FOUND'});
+    const transitions={board:['reserved','occupied'],no_show:['reserved','available'],occupy:['available','occupied'],release:['occupied','available']};
+    const [from,to]=transitions[action];
+    if(seat.status!==from) return res.status(409).json({message:`Seat is ${seat.status}; action ${action} is not allowed.`,code:'SEAT_STATE_CONFLICT'});
+    let notifyPassenger=null;
+    await runInTransaction(async session => {
+      const changed=await Seat.findOneAndUpdate({ _id:seat._id, status:from }, { $set:{ status:to, ...(to==='available'?{booking:null}:{}) } }, { new:true, session });
+      if(!changed) { const conflict=new Error('Seat state changed; refresh the seat map.'); conflict.status=409; conflict.code='SEAT_STATE_CONFLICT'; throw conflict; }
+      if(action==='board'||action==='no_show') {
+        const booking=await Booking.findOneAndUpdate({ _id:seat.booking, status:'confirmed', shift:bus.shiftId }, { $set:{ status:action==='board'?'boarded':'no_show', locationSharingActive:false } }, { new:true, session }).select('user');
+        if(!booking) { const conflict=new Error('Reservation is no longer active.'); conflict.status=409; conflict.code='BOOKING_STATE_CONFLICT'; throw conflict; }
+        if(action==='no_show') notifyPassenger=booking.user;
+      }
+      if(action==='release'&&seat.booking) await Booking.updateOne({ _id:seat.booking, status:'boarded', shift:bus.shiftId }, { $set:{ status:'completed', locationSharingActive:false } }, { session });
+    });
+    seat.status=to;
+    await emitSeatState(req,bus);
+    if(action==='no_show'&&notifyPassenger) req.app.get('io')?.to(`passenger:${notifyPassenger}`).emit('bookingStatusUpdate',{status:'no_show',message:'Your driver marked this reservation as no-show.'});
+    res.json({seat:{seatNumber:seat.seatNumber,status:seat.status}});
+  } catch(error){sendApiError(res,error,'Could not update seat.');}
+};
+
+const addWalkIn = async(req,res) => {
+  try {
+    const bus=await getOperatingBusForDriver(req.user._id);
+    if(!bus) return res.status(409).json({message:'Only your own bus with an open shift can be managed.',code:'SHIFT_NOT_OPEN'});
+    const candidates=(await Seat.find({bus:bus._id,shift:bus.shiftId,status:'available'}).select('_id seatNumber').lean()).sort((a,b)=>Number(a.seatNumber)-Number(b.seatNumber));
+    let seat=null;
+    for(const candidate of candidates){ seat=await Seat.findOneAndUpdate({_id:candidate._id,status:'available'},{$set:{status:'occupied',booking:null}},{new:true}); if(seat) break; }
+    if(!seat) return res.status(409).json({message:'No seats are available for a walk-in.',code:'NO_SEATS_AVAILABLE'});
+    await emitSeatState(req,bus); res.status(201).json({seat:{seatNumber:seat.seatNumber,status:seat.status}});
+  } catch(error){sendApiError(res,error,'Could not add walk-in.');}
 };
 
 // @route   GET /api/buses/:id/eta
@@ -201,7 +284,7 @@ const getBusETA = async (req, res) => {
     const result = await calculateNextStopAndETA(bus);
     res.status(200).json(result);
   } catch (err) {
-    res.status(500).json({ message: 'Server error calculating ETA', error: err.message });
+    sendApiError(res, err, 'Could not calculate the bus ETA.');
   }
 };
 
@@ -225,13 +308,14 @@ const updateBusLocation = async (req, res) => {
     if (!sameId(req.user.assignedBus, bus._id) || !sameId(bus.driver, req.user._id)) {
       return res.status(403).json({ message: 'Forbidden: this bus is not assigned to you.' });
     }
-    if (!await Shift.exists({ driver: req.user._id, bus: bus._id, status: 'active' })) {
+    const operatingBus = await getOperatingBusForDriver(req.user._id);
+    if (!operatingBus || !sameId(operatingBus._id, bus._id)) {
       return res.status(409).json({ message: 'Start an active shift before updating location.' });
     }
+    await Shift.updateOne({ _id: operatingBus.shiftId, status: 'active', endedAt: null }, { $set: { heartbeatAt: new Date() } });
 
     bus.currentLocation = { latitude, longitude };
     bus.lastLocationUpdate = new Date();
-    bus.status = 'active';
 
     // Maintain a rolling window of the last 5 speed readings
     if (speed != null && !Number.isNaN(speed)) {
@@ -259,44 +343,13 @@ const updateBusLocation = async (req, res) => {
 
     res.status(200).json({ ...bus.toObject(), ...etaInfo });
   } catch (err) {
-    res.status(500).json({ message: 'Server error updating bus location', error: err.message });
+    sendApiError(res, err, 'Could not update the bus location.');
   }
 };
 
 // @route   PATCH /api/buses/:id/seats
 const updateSeatAvailability = async (req, res) => {
-  try {
-    const { availableSeats } = req.body;
-    const nextAvailableSeats = Number(availableSeats);
-    if (!Number.isInteger(nextAvailableSeats) || nextAvailableSeats < 0) {
-      return res.status(400).json({ message: 'availableSeats must be a non-negative whole number' });
-    }
-
-    const bus = await Bus.findById(req.params.id);
-    if (!bus) {
-      return res.status(404).json({ message: 'Bus not found' });
-    }
-
-    if (req.user.role === 'driver') {
-      if (!sameId(bus.driver, req.user._id) || !sameId(req.user.assignedBus, bus._id)) {
-        return res.status(403).json({ message: 'You can only update the bus assigned to you.' });
-      }
-      if (bus.status !== 'active' || !await Shift.exists({ driver: req.user._id, bus: bus._id, status: 'active' })) {
-        return res.status(409).json({ message: 'Start your assigned shift before updating passenger count.' });
-      }
-    }
-    if (nextAvailableSeats > bus.capacity) {
-      return res.status(400).json({ message: `availableSeats cannot exceed vehicle capacity (${bus.capacity}).` });
-    }
-
-    bus.availableSeats = nextAvailableSeats;
-    await bus.save();
-    emitSeatAvailability(req, bus);
-
-    res.status(200).json(bus);
-  } catch (err) {
-    sendApiError(res, err, 'Server error updating seat availability');
-  }
+  return res.status(410).json({ message: 'Seat availability now comes from the active shift seat map.', code: 'USE_SHIFT_SEAT_MAP' });
 };
 
 // @route   PUT /api/buses/:id
@@ -322,7 +375,12 @@ const deleteBus = async (req, res) => {
 module.exports = {
   createBus,
   getBuses,
+  getActiveBusesForRoute,
   getBusById,
+  getBusSeats,
+  getAssignedDriverSeats,
+  updateAssignedSeat,
+  addWalkIn,
   getBusETA,
   updateBusLocation,
   startReturnTrip,

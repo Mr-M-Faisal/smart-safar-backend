@@ -22,10 +22,6 @@ const busSchema = new mongoose.Schema(
       type: Number,
       required: true,
     },
-    availableSeats: {
-      type: Number,
-      required: true,
-    },
     currentLocation: {
       latitude: { type: Number, default: null },
       longitude: { type: Number, default: null },

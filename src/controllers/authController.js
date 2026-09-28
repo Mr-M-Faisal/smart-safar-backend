@@ -1,7 +1,8 @@
 const { randomBytes } = require('crypto');
 const User = require('../models/User');
 const Shift = require('../models/Shift');
-const generateToken = require('../utils/generateToken');
+const { getOperatingBusForDriver } = require('../services/operatingBusService');
+const { createSession, rotateSession, revokeSession } = require('../services/authSessionService');
 const { ApiError, sendApiError } = require('../utils/apiError');
 const { requireObjectBody, validateAccountFields } = require('../utils/accountValidation');
 
@@ -19,8 +20,8 @@ const registerUser = async (req, res) => {
     // Password hashing remains in User's existing pre-save hook. Public callers
     // cannot provision privileged roles or set a profile assignment.
     const newUser = await User.create({ ...fields, role: 'commuter', assignedBus: null });
-    const token = generateToken(newUser._id, newUser.role);
-    res.status(201).json({ _id: newUser._id, name: newUser.name, email: newUser.email, role: newUser.role, token });
+    const session = await createSession(newUser);
+    res.status(201).json({ _id: newUser._id, name: newUser.name, email: newUser.email, role: newUser.role, ...session });
   } catch (error) {
     if (error.code === 11000) return res.status(400).json({ message: 'User already exists' });
     sendApiError(res, error, 'Server error');
@@ -39,8 +40,8 @@ const loginUser = async (req, res) => {
     const foundUser = await User.findOne({ email: email.trim().toLowerCase() });
     if (!foundUser) throw new ApiError(400, 'User not found');
     if (!(await foundUser.matchPassword(password))) throw new ApiError(400, 'Invalid credentials');
-    const token = generateToken(foundUser._id, foundUser.role);
-    res.status(200).json({ _id: foundUser._id, name: foundUser.name, email: foundUser.email, role: foundUser.role, token });
+    const session = await createSession(foundUser);
+    res.status(200).json({ _id: foundUser._id, name: foundUser.name, email: foundUser.email, role: foundUser.role, ...session });
   } catch (error) {
     sendApiError(res, error, 'Server error');
   }
@@ -69,8 +70,8 @@ const devLogin = async (req, res) => {
       });
     }
     if (user.role !== role) throw new ApiError(403, 'Test account role mismatch');
-    const token = generateToken(user._id, user.role);
-    return res.status(200).json({ _id: user._id, name: user.name, email: user.email, role: user.role, token });
+    const session = await createSession(user);
+    return res.status(200).json({ _id: user._id, name: user.name, email: user.email, role: user.role, ...session });
   } catch (error) {
     return sendApiError(res, error, 'Could not start local test session');
   }
@@ -80,9 +81,10 @@ const devLogin = async (req, res) => {
 // @access  Private (current authenticated user, without password)
 const getMe = async (req, res) => {
   try {
-    const activeShift = req.user.role === 'driver'
-      ? await Shift.findOne({ driver: req.user._id, status: 'active' })
-        .populate('bus', 'busNumber status direction currentStopIndex route')
+    const currentBus = req.user.role === 'driver' ? await getOperatingBusForDriver(req.user._id) : null;
+    const activeShift = currentBus?.shiftId
+      ? await Shift.findOne({ _id: currentBus.shiftId, driver: req.user._id, bus: currentBus._id, status: 'active', endedAt: null })
+        .populate('bus', 'busNumber status direction currentStopIndex route capacity')
         .populate('route', 'routeName startPoint endPoint')
         .lean()
       : null;
@@ -92,4 +94,17 @@ const getMe = async (req, res) => {
   }
 };
 
-module.exports = { registerUser, loginUser, devLogin, getMe };
+const refreshSession = async (req, res) => {
+  try {
+    const session = await rotateSession(req.body?.refreshToken);
+    if (!session) return res.status(401).json({ message: 'Refresh session is invalid or expired.', code: 'REFRESH_REJECTED' });
+    res.status(200).json(session);
+  } catch (error) { sendApiError(res, error, 'Could not refresh session.'); }
+};
+
+const logout = async (req, res) => {
+  try { await revokeSession(req.body?.refreshToken); res.status(204).end(); }
+  catch (error) { sendApiError(res, error, 'Could not revoke session.'); }
+};
+
+module.exports = { registerUser, loginUser, devLogin, getMe, refreshSession, logout };

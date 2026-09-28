@@ -17,9 +17,10 @@ const bookingSchema = new mongoose.Schema(
     bus: { type: mongoose.Schema.Types.ObjectId, ref: 'Bus', required: true },
     // Nullable for records created before route-first booking. New bookings set both.
     route: { type: mongoose.Schema.Types.ObjectId, ref: 'Route', default: null },
+    shift: { type: mongoose.Schema.Types.ObjectId, ref: 'Shift', default: null },
     driver: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
     seatNumber: { type: String, default: null, trim: true },
-    status: { type: String, enum: ['confirmed', 'cancelled', 'completed'], default: 'confirmed' },
+    status: { type: String, enum: ['confirmed', 'boarded', 'no_show', 'cancelled', 'cancelled_by_service', 'completed'], default: 'confirmed' },
     paymentStatus: {
       type: String,
       enum: ['pending', 'paid', 'failed', 'cancelled'],
@@ -54,5 +55,6 @@ bookingSchema.pre('save', function stopLocationForInactiveBooking(next) {
 bookingSchema.index({ user: 1, createdAt: -1 });
 bookingSchema.index({ bus: 1, status: 1, seatNumber: 1 });
 bookingSchema.index({ route: 1, status: 1 });
+bookingSchema.index({ shift: 1, seatNumber: 1, status: 1 });
 
 module.exports = mongoose.model('Booking', bookingSchema);

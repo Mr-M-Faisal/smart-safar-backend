@@ -8,6 +8,8 @@ const { ApiError } = require('../utils/apiError');
 const { assertObjectId, requireObjectBody } = require('../utils/accountValidation');
 const { runInTransaction } = require('./transactionService');
 const { getBookingPrice } = require('./paymentService');
+const Seat = require('../models/Seat');
+const { getOperatingBusesForRoute, getOperatingBusForDriver } = require('./operatingBusService');
 
 function sameId(left, right) {
   return Boolean(left && right && left.toString() === right.toString());
@@ -16,7 +18,7 @@ function sameId(left, right) {
 function populatedBooking(id) {
   return Booking.findById(id)
     .populate('user', 'name')
-    .populate('bus', 'busNumber route driver status availableSeats capacity')
+    .populate('bus', 'busNumber route driver status capacity')
     .populate('route', 'routeName startPoint endPoint')
     .populate('driver', 'name');
 }
@@ -65,12 +67,13 @@ function validateCreateBody(body) {
 
   let seatNumber = null;
   if (Object.hasOwn(body, 'seatNumber') && body.seatNumber !== null) {
-    if (typeof body.seatNumber !== 'string' || !body.seatNumber.trim()) {
-      throw new ApiError(400, 'seatNumber must be a non-empty string.');
+    if (!(typeof body.seatNumber === 'string' || typeof body.seatNumber === 'number') || !String(body.seatNumber).trim()) {
+      throw new ApiError(400, 'seatNumber is required and must identify a seat on the selected bus.');
     }
-    seatNumber = body.seatNumber.trim().toUpperCase();
+    seatNumber = String(body.seatNumber).trim().toUpperCase();
     if (seatNumber.length > 32) throw new ApiError(400, 'seatNumber is too long.');
   }
+  if (!seatNumber || !/^[1-9]\d*$/.test(seatNumber)) throw new ApiError(400, 'Choose a valid numbered seat on the selected bus.');
 
   const paymentMethod = body.paymentMethod || 'cash';
   if (!['cash', 'online'].includes(paymentMethod)) {
@@ -138,72 +141,20 @@ async function requireActiveRoute(routeId, session) {
 }
 
 async function validOperationalAssignment(bus, routeId, session) {
-  if (
-    !bus ||
-    bus.status !== 'active' ||
-    !sameId(bus.route, routeId) ||
-    !bus.driver
-  ) {
-    return null;
-  }
-
-  const driver = await User.findOne({
-    _id: bus.driver,
-    role: 'driver',
-    assignedBus: bus._id,
-  })
-    .select('_id')
-    .session(session);
-  if (!driver) return null;
-
-  const shift = await Shift.findOne({
-    driver: driver._id,
-    bus: bus._id,
-    route: routeId,
-    status: 'active',
-  })
-    .select('_id')
-    .session(session);
-  return shift ? driver : null;
+  if (!bus || !sameId(bus.route, routeId)) return null;
+  const operating = await getOperatingBusesForRoute(routeId, session);
+  const match = operating.find(item => sameId(item._id, bus._id));
+  return match ? { driver: match.driver, shiftId: match.shiftId, bus: match } : null;
 }
 
 async function bookingReadinessMessage(routeId, session, onlyBus = null) {
   const buses = onlyBus ? [onlyBus] : await Bus.find({ route: routeId }).session(session);
   if (!buses.length) return 'No bus has been assigned to this route yet. Contact the transit team to assign a bus.';
-
-  const withSeats = buses.filter((bus) => Number(bus.availableSeats) > 0);
-  if (!withSeats.length) return 'All buses assigned to this route are full. Please try again later or choose another route.';
-
-  const serviceable = withSeats.filter((bus) => bus.status !== 'maintenance');
-  if (!serviceable.length) return 'The assigned bus is under maintenance and cannot be booked right now.';
-
-  let hasAssignedDriver = false;
-  let hasActiveShift = false;
-  for (const bus of serviceable) {
-    if (!bus.driver) continue;
-    const driver = await User.findOne({
-      _id: bus.driver,
-      role: 'driver',
-      assignedBus: bus._id,
-    }).select('_id').session(session);
-    if (!driver) continue;
-    hasAssignedDriver = true;
-
-    const shift = await Shift.findOne({
-      driver: driver._id,
-      bus: bus._id,
-      route: routeId,
-      status: 'active',
-    }).select('_id').session(session);
-    if (shift) {
-      hasActiveShift = true;
-      if (bus.status === 'active') return 'The active shift and bus assignment could not be matched. Refresh and retry; if it continues, ask the administrator to verify the route assignment.';
-    }
-  }
-
-  if (!hasAssignedDriver) return 'A bus is assigned to this route, but it has no valid driver assignment. Ask the administrator to assign a driver.';
-  if (!hasActiveShift) return 'A bus and driver are assigned, but the driver has not started a shift. Ask the driver to start their shift, then try booking again.';
-  return 'The driver shift is active, but the bus is not marked as operating. Ask the administrator to check the bus status.';
+  const operating = await getOperatingBusesForRoute(routeId, session);
+  if (operating.length && operating.every(bus => bus.availableSeats <= 0)) return 'All buses assigned to this route are full. Please try again later or choose another route.';
+  if (buses.every(bus => bus.status === 'maintenance')) return 'The assigned bus is under maintenance and cannot be booked right now.';
+  if (buses.some(bus => bus.driver)) return 'No buses running on this route right now. Ask the driver to start a shift, then try again.';
+  return 'A bus is assigned to this route, but it has no driver yet. Ask the administrator to assign a driver.';
 }
 
 async function resolveBookingAssignment(values, session) {
@@ -223,39 +174,23 @@ async function resolveBookingAssignment(values, session) {
   const route = await requireActiveRoute(routeId, session);
 
   if (!bus) {
-    const candidates = await Bus.find({
-      route: route._id,
-      status: 'active',
-      driver: { $ne: null },
-      availableSeats: { $gt: 0 },
-    })
-      .sort({ lastLocationUpdate: -1, busNumber: 1, _id: 1 })
-      .session(session);
-
-    for (const candidate of candidates) {
-      const driver = await validOperationalAssignment(candidate, route._id, session);
-      if (driver) {
-        bus = candidate;
-        break;
-      }
-    }
-    if (!bus) {
+    const candidates = await getOperatingBusesForRoute(route._id, session);
+    const candidate = candidates.find(item => item.availableSeats > 0);
+    if (!candidate) {
       throw new ApiError(409, await bookingReadinessMessage(route._id, session));
     }
+    bus = await Bus.findById(candidate._id).session(session);
   }
 
-  const driver = await validOperationalAssignment(bus, route._id, session);
-  if (!driver) {
+  const assignment = await validOperationalAssignment(bus, route._id, session);
+  if (!assignment) {
     throw new ApiError(409, await bookingReadinessMessage(route._id, session, bus));
   }
+  const { driver, shiftId } = assignment;
   if (values.driverId && !sameId(driver._id, values.driverId)) {
     throw new ApiError(400, 'The selected driver is not assigned to this bus and route.');
   }
-  if (bus.availableSeats <= 0) {
-    throw new ApiError(409, 'No seats are available on this bus.');
-  }
-
-  return { route, bus, driver };
+  return { route, bus, driver, shiftId };
 }
 
 async function createBookingFromRequest(userId, body) {
@@ -263,27 +198,19 @@ async function createBookingFromRequest(userId, body) {
   const price = getBookingPrice();
 
   const bookingId = await runInTransaction(async (session) => {
-    const { route, bus, driver } = await resolveBookingAssignment(values, session);
+    const { route, bus, driver, shiftId } = await resolveBookingAssignment(values, session);
 
     const duplicate = await Booking.findOne({
       user: userId,
       bus: bus._id,
-      status: 'confirmed',
+      status: { $in: ['confirmed', 'boarded'] },
     })
       .select('_id')
       .session(session);
     if (duplicate) throw new ApiError(409, 'You already have an active booking on this bus.');
 
-    if (values.seatNumber) {
-      const occupiedSeat = await Booking.findOne({
-        bus: bus._id,
-        seatNumber: values.seatNumber,
-        status: 'confirmed',
-      })
-        .select('_id')
-        .session(session);
-      if (occupiedSeat) throw new ApiError(409, 'The selected seat is already booked.');
-    }
+    const availableSeat = await Seat.findOne({ bus: bus._id, shift: shiftId, seatNumber: values.seatNumber, status: 'available' }).session(session);
+    if (!availableSeat) throw new ApiError(409, 'That seat was just taken, please pick another.');
 
     const [booking] = await Booking.create(
       [
@@ -291,6 +218,7 @@ async function createBookingFromRequest(userId, body) {
           user: userId,
           bus: bus._id,
           route: route._id,
+          shift: shiftId,
           driver: driver._id,
           seatNumber: values.seatNumber,
           paymentMethod: values.paymentMethod,
@@ -304,8 +232,8 @@ async function createBookingFromRequest(userId, body) {
       { session }
     );
 
-    bus.availableSeats -= 1;
-    await bus.save({ session });
+    const claimed = await Seat.updateOne({ _id: availableSeat._id, status: 'available', booking: null }, { $set: { status: 'reserved', booking: booking._id } }, { session });
+    if (claimed.modifiedCount !== 1) throw new ApiError(409, 'That seat was just taken, please pick another.');
     return booking._id;
   });
 
@@ -313,11 +241,7 @@ async function createBookingFromRequest(userId, body) {
 }
 
 async function releaseSeat(booking, session) {
-  const bus = await Bus.findById(booking.bus).session(session);
-  if (bus && bus.availableSeats < bus.capacity) {
-    bus.availableSeats += 1;
-    await bus.save({ session });
-  }
+  if (booking.shift && booking.seatNumber) await Seat.updateOne({ shift: booking.shift, seatNumber: booking.seatNumber, booking: booking._id, status: { $in: ['reserved', 'occupied'] } }, { $set: { status: 'available', booking: null } }, { session });
 }
 
 async function cancelUserBooking(bookingId, userId) {
@@ -335,6 +259,7 @@ async function cancelUserBooking(bookingId, userId) {
     if (booking.status === 'completed') {
       throw new ApiError(409, 'A completed booking cannot be cancelled.');
     }
+    if (booking.status === 'boarded') throw new ApiError(409, 'A boarded passenger cannot cancel an active trip.');
 
     const locationStopped = booking.locationSharingActive;
     booking.status = 'cancelled';
@@ -355,6 +280,7 @@ async function cancelAdminBooking(bookingId) {
     if (!booking) throw new ApiError(404, 'Booking not found.');
     if (booking.status === 'cancelled') throw new ApiError(400, 'Booking is already cancelled.');
     if (booking.status === 'completed') throw new ApiError(409, 'A completed booking cannot be cancelled.');
+    if (booking.status === 'boarded') throw new ApiError(409, 'A boarded passenger cannot be cancelled by the administrator.');
     const locationStopped = booking.locationSharingActive;
     booking.status = 'cancelled';
     booking.locationSharingActive = false;
@@ -392,8 +318,8 @@ async function requireBookingActiveAssignment(booking) {
   if (!bus || !sameId(bus.route, booking.route) || !sameId(bus.driver, booking.driver)) {
     throw new ApiError(409, 'The booking no longer has a valid bus and driver assignment.');
   }
-  const driver = await validOperationalAssignment(bus, booking.route, null);
-  if (!driver || !sameId(driver._id, booking.driver)) {
+  const assignment = await validOperationalAssignment(bus, booking.route, null);
+  if (!assignment || !sameId(assignment.driver._id, booking.driver)) {
     throw new ApiError(409, 'Passenger location can only be shared during the assigned driver shift.');
   }
 }
@@ -420,24 +346,12 @@ async function updatePassengerLocation(bookingId, userId, body) {
 }
 
 async function activeDriverContext(driverId) {
-  const driver = await User.findOne({ _id: driverId, role: 'driver' }).select('assignedBus');
-  if (!driver || !driver.assignedBus) {
-    throw new ApiError(409, 'An assigned bus and active shift are required.');
-  }
-
-  const bus = await Bus.findById(driver.assignedBus);
-  if (!bus || bus.status !== 'active' || !sameId(bus.driver, driver._id) || !bus.route) {
-    throw new ApiError(409, 'An assigned bus and active shift are required.');
-  }
-
-  const shift = await Shift.findOne({
-    driver: driver._id,
-    bus: bus._id,
-    route: bus.route,
-    status: 'active',
-  }).select('_id');
-  if (!shift) throw new ApiError(409, 'An assigned bus and active shift are required.');
-  return { driver, bus };
+  const operating = await getOperatingBusForDriver(driverId);
+  if (!operating) throw new ApiError(409, 'An assigned bus and open shift are required.');
+  const driver = await User.findById(driverId).select('_id name assignedBus');
+  const bus = await Bus.findById(operating._id);
+  if (!driver || !bus) throw new ApiError(409, 'An assigned bus and open shift are required.');
+  return { driver, bus, shiftId: operating.shiftId };
 }
 
 async function getPassengerLocationsForDriver(driverId) {
@@ -523,14 +437,8 @@ async function applyVerifiedPayment(notification) {
 
 async function emitPassengerLocation(io, booking, sharing) {
   if (!io || !booking?.driver || !booking?.bus || !booking?.route) return false;
-
-  const shift = await Shift.exists({
-    driver: booking.driver._id || booking.driver,
-    bus: booking.bus._id || booking.bus,
-    route: booking.route._id || booking.route,
-    status: 'active',
-  });
-  if (!shift) return false;
+  const operating = await getOperatingBusForDriver(booking.driver._id || booking.driver);
+  if (!operating || !sameId(operating._id, booking.bus._id || booking.bus) || !sameId(operating.route, booking.route._id || booking.route)) return false;
 
   const payload = {
     bookingId: booking._id,

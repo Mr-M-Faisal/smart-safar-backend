@@ -7,6 +7,8 @@ const { ApiError, sendApiError } = require('../utils/apiError');
 const { assertObjectId, validateAccountFields } = require('../utils/accountValidation');
 const Report = require('../models/Report');
 const Shift = require('../models/Shift');
+const { getOperatingBusesForRoute } = require('../services/operatingBusService');
+const Seat = require('../models/Seat');
 
 // @route   GET /api/admin/overview
 // @desc    High-level fleet snapshot for the dashboard home screen
@@ -16,27 +18,19 @@ const getFleetOverview = async (req, res) => {
     const startOfToday = new Date();
     startOfToday.setHours(0, 0, 0, 0);
 
-    const [
-      totalBuses,
-      activeBuses,
-      idleBuses,
-      maintenanceBuses,
-      totalRoutes,
-      bookingsToday,
-      totalBookings,
-      openReports,
-      activeShifts,
-    ] = await Promise.all([
+    const [totalBuses, maintenanceBuses, totalRoutes, bookingsToday, totalBookings, openReports] = await Promise.all([
       Bus.countDocuments({}),
-      Bus.countDocuments({ status: 'active' }),
-      Bus.countDocuments({ status: 'idle' }),
       Bus.countDocuments({ status: 'maintenance' }),
       Route.countDocuments({ isActive: true }),
       Booking.countDocuments({ createdAt: { $gte: startOfToday } }),
       Booking.countDocuments({}),
       Report.countDocuments({ status: 'open' }),
-      Shift.countDocuments({ status: 'active' }),
     ]);
+    const routeIds = await Shift.distinct('route', { status: 'active', endedAt: null });
+    const operatingBuses = (await Promise.all(routeIds.map(id => getOperatingBusesForRoute(id)))).flat();
+    const activeBuses = operatingBuses.length;
+    const activeShifts = activeBuses;
+    const idleBuses = Math.max(0, totalBuses - activeBuses - maintenanceBuses);
 
     res.status(200).json({
       buses: { total: totalBuses, active: activeBuses, idle: idleBuses, maintenance: maintenanceBuses },
@@ -71,7 +65,7 @@ const getBookingsAnalytics = async (req, res) => {
           totalBookings: { $sum: 1 },
           totalRevenue: { $sum: '$fare' },
           cancelled: {
-            $sum: { $cond: [{ $eq: ['$status', 'cancelled'] }, 1, 0] },
+            $sum: { $cond: [{ $in: ['$status', ['cancelled', 'cancelled_by_service', 'no_show']] }, 1, 0] },
           },
         },
       },
@@ -91,49 +85,13 @@ const getBookingsAnalytics = async (req, res) => {
 // @access  Private (admin)
 const getOccupancyByRoute = async (req, res) => {
   try {
-    const results = await Bus.aggregate([
-      // Stage 1: work out this bus's occupancy percentage
-      {
-        $project: {
-          route: 1,
-          busNumber: 1,
-          occupancyPercent: {
-            $multiply: [
-              { $divide: [{ $subtract: ['$capacity', '$availableSeats'] }, '$capacity'] },
-              100,
-            ],
-          },
-        },
-      },
-      // Stage 2: group all buses by route, average their occupancy
-      {
-        $group: {
-          _id: '$route',
-          averageOccupancy: { $avg: '$occupancyPercent' },
-          busCount: { $sum: 1 },
-        },
-      },
-      // Stage 3: pull in the route's name instead of just its ID
-      {
-        $lookup: {
-          from: 'routes',
-          localField: '_id',
-          foreignField: '_id',
-          as: 'routeInfo',
-        },
-      },
-      { $unwind: '$routeInfo' },
-      {
-        $project: {
-          _id: 0,
-          routeId: '$_id',
-          routeName: '$routeInfo.routeName',
-          busCount: 1,
-          averageOccupancy: { $round: ['$averageOccupancy', 1] },
-        },
-      },
-    ]);
-
+    const routes = await Route.find({ isActive: true }).select('_id routeName').lean();
+    const results = await Promise.all(routes.map(async route => {
+      const operating = await getOperatingBusesForRoute(route._id);
+      const capacities = operating.reduce((sum, bus) => sum + Number(bus.capacity || 0), 0);
+      const occupied = operating.reduce((sum, bus) => sum + Number(bus.capacity || 0) - Number(bus.availableSeats || 0), 0);
+      return { routeId: route._id, routeName: route.routeName, busCount: operating.length, occupiedSeats: occupied, capacity: capacities, averageOccupancy: capacities ? Math.round((occupied / capacities) * 1000) / 10 : 0 };
+    }));
     res.status(200).json(results);
   } catch (err) {
     res.status(500).json({ message: 'Server error fetching occupancy analytics', error: err.message });
@@ -172,10 +130,44 @@ const getShifts = async (req, res) => {
   }
 };
 
+const getOperatingConsistency = async (req, res) => {
+  try {
+    const [buses, shifts] = await Promise.all([
+      Bus.find({}).select('_id busNumber route driver status').lean(),
+      Shift.find({ status: 'active', endedAt: null }).select('_id bus driver route startedAt heartbeatAt').lean(),
+    ]);
+    const routeIds = [...new Set([...buses.map(b => String(b.route || '')), ...shifts.map(s => String(s.route || ''))].filter(Boolean))];
+    const operating = (await Promise.all(routeIds.map(id => getOperatingBusesForRoute(id)))).flat();
+    const operatingByBus = new Set(operating.map(b => String(b._id)));
+    const shiftByBus = new Map(shifts.map(s => [String(s.bus), s]));
+    const mismatches = [];
+    const busShiftCounts = new Map();
+    const driverShiftCounts = new Map();
+    const staleMs = Math.max(1, Number(process.env.SHIFT_STALE_HOURS || 12)) * 60 * 60 * 1000;
+    for (const shift of shifts) {
+      const busId = String(shift.bus); const driverId = String(shift.driver);
+      busShiftCounts.set(busId, (busShiftCounts.get(busId) || 0) + 1);
+      driverShiftCounts.set(driverId, (driverShiftCounts.get(driverId) || 0) + 1);
+      if (Date.now() - new Date(shift.heartbeatAt || shift.startedAt).getTime() >= staleMs) mismatches.push({ type: 'stale_open_shift', shiftId: shift._id, busId: shift.bus, driverId });
+    }
+    for (const [busId, count] of busShiftCounts) if (count > 1) mismatches.push({ type: 'multiple_open_shifts_for_bus', busId, count });
+    for (const [driverId, count] of driverShiftCounts) if (count > 1) mismatches.push({ type: 'multiple_open_shifts_for_driver', driverId, count });
+    for (const bus of buses) {
+      const id = String(bus._id);
+      const shift = shiftByBus.get(id);
+      if (bus.status === 'active' && !operatingByBus.has(id)) mismatches.push({ type: 'active_bus_without_operating_shift', busId: bus._id, busNumber: bus.busNumber });
+      if (operatingByBus.has(id) && bus.status !== 'active') mismatches.push({ type: 'operating_shift_bus_not_active', busId: bus._id, busNumber: bus.busNumber });
+      if (shift && !operatingByBus.has(id)) mismatches.push({ type: 'open_shift_assignment_mismatch', shiftId: shift._id, busId: bus._id, busNumber: bus.busNumber });
+    }
+    for (const shift of shifts) if (!buses.some(b => String(b._id) === String(shift.bus))) mismatches.push({ type: 'open_shift_missing_bus', shiftId: shift._id, busId: shift.bus });
+    res.json({ checkedAt: new Date().toISOString(), count: mismatches.length, mismatches });
+  } catch (error) { sendApiError(res, error, 'Could not check operating consistency.'); }
+};
+
 const getAdminBookings = async (req, res) => {
   try {
     const filter = {};
-    if (['confirmed', 'cancelled', 'completed'].includes(req.query.status)) filter.status = req.query.status;
+    if (['confirmed', 'boarded', 'no_show', 'cancelled', 'cancelled_by_service', 'completed'].includes(req.query.status)) filter.status = req.query.status;
     if (['pending', 'paid', 'failed', 'cancelled'].includes(req.query.paymentStatus)) filter.paymentStatus = req.query.paymentStatus;
     const bookings = await Booking.find(filter)
       .populate('user', 'name email phone')
@@ -194,8 +186,9 @@ const cancelAdminBookingAction = async (req, res) => {
     const result = await cancelAdminBooking(req.params.id);
     const io = req.app.get('io');
     const bus = result.booking?.bus;
-    if (bus?._id && bus.availableSeats != null) {
-      io?.to(`bus:${bus._id}`).emit('seatAvailabilityUpdate', { busId: bus._id, availableSeats: bus.availableSeats, capacity: bus.capacity });
+    if (bus?._id && result.booking?.shift) {
+      const seats = await Seat.find({ shift: result.booking.shift }).select('seatNumber status updatedAt').lean();
+      io?.to(`bus:${bus._id}`).emit('seatStateUpdate', { busId: bus._id, shiftId: result.booking.shift, seats, capacity: seats.length, available: seats.filter(s=>s.status==='available').length, reserved: seats.filter(s=>s.status==='reserved').length, occupied: seats.filter(s=>s.status==='occupied').length });
     }
     if (result.locationStopped && result.booking?.driver?._id) {
       io?.to(`driver:${result.booking.driver._id}`).emit('passengerLocationUpdate', { bookingId: result.booking._id, passenger: { id: result.booking.user?._id, name: result.booking.user?.name || null }, sharing: false });
@@ -234,6 +227,7 @@ module.exports = {
   getOccupancyByRoute,
   getReportsSummary,
   getShifts,
+  getOperatingConsistency,
   getAdminBookings,
   cancelAdminBookingAction,
   getCommuters,

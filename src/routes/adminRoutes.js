@@ -6,6 +6,7 @@ const {
   getOccupancyByRoute,
   getReportsSummary,
   getShifts,
+  getOperatingConsistency,
   getAdminBookings,
   cancelAdminBookingAction,
   getCommuters,
@@ -22,6 +23,7 @@ router.get('/analytics/bookings', getBookingsAnalytics);
 router.get('/analytics/occupancy', getOccupancyByRoute);
 router.get('/analytics/reports', getReportsSummary);
 router.get('/shifts', getShifts);
+router.get('/operating-consistency', getOperatingConsistency);
 router.get('/bookings', getAdminBookings);
 router.patch('/bookings/:id/cancel', cancelAdminBookingAction);
 router.get('/users', getCommuters);

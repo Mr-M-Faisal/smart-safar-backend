@@ -9,13 +9,13 @@ const {
   updatePassengerLocation,
 } = require('../services/bookingService');
 const { verifyPaymentNotification } = require('../services/paymentService');
+const Seat = require('../models/Seat');
 
-const emitSeatAvailability = (io, bus) => {
-  if (!bus) return;
-  const id = typeof bus === 'object' ? bus._id : bus;
-  const availableSeats = typeof bus === 'object' ? bus.availableSeats : undefined;
-  const capacity = typeof bus === 'object' ? bus.capacity : undefined;
-  if (id && availableSeats != null) io.to(`bus:${id}`).emit('seatAvailabilityUpdate', { busId: id, availableSeats, capacity });
+const emitSeatAvailability = async (io, booking) => {
+  if (!booking?.bus || !booking?.shift) return;
+  const seats = (await Seat.find({ shift: booking.shift }).select('seatNumber status updatedAt').lean()).sort((a,b) => Number(a.seatNumber) - Number(b.seatNumber));
+  const payload = { busId: booking.bus._id || booking.bus, shiftId: booking.shift, seats, capacity: seats.length, available: seats.filter(s=>s.status==='available').length, reserved: seats.filter(s=>s.status==='reserved').length, occupied: seats.filter(s=>s.status==='occupied').length };
+  io?.to(`bus:${payload.busId}`).emit('seatStateUpdate', payload);
 };
 
 // @route   POST /api/bookings
@@ -24,7 +24,7 @@ const emitSeatAvailability = (io, bus) => {
 const createBooking = async (req, res) => {
   try {
     const booking = await createBookingFromRequest(req.user._id, req.body);
-    emitSeatAvailability(req.app.get('io'), booking.bus);
+    await emitSeatAvailability(req.app.get('io'), booking);
     if (booking.locationSharingActive) {
       await emitPassengerLocation(req.app.get('io'), booking, true);
     }
@@ -56,7 +56,7 @@ const getMyBookings = async (req, res) => {
 const cancelBooking = async (req, res) => {
   try {
     const result = await cancelUserBooking(req.params.id, req.user._id);
-    emitSeatAvailability(req.app.get('io'), result.booking?.bus);
+    await emitSeatAvailability(req.app.get('io'), result.booking);
     if (result.locationStopped) {
       await emitPassengerLocation(req.app.get('io'), result.booking, false);
     }

@@ -20,6 +20,7 @@ const Report = require('../src/models/Report');
 const RouteAlert = require('../src/models/RouteAlert');
 const SafetySession = require('../src/models/SafetySession');
 const Shift = require('../src/models/Shift');
+const Seat = require('../src/models/Seat');
 
 const testDatabase = 'transit_driver_test_' + crypto.randomBytes(8).toString('hex');
 const password = crypto.randomBytes(18).toString('hex');
@@ -37,7 +38,7 @@ async function request(path, token, method = 'GET', body, extraHeaders = {}) {
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     signal: AbortSignal.timeout(45000),
   });
-  return { status: response.status, data: await response.json() };
+  return { status: response.status, data: response.status === 204 ? null : await response.json() };
 }
 
 function paymentSignature(body) {
@@ -62,7 +63,8 @@ function assertSafeDriver(record) {
 async function login(email, suppliedPassword = password) {
   const result = await request('/api/auth/login', null, 'POST', { email, password: suppliedPassword });
   assert.equal(result.status, 200);
-  assert.deepEqual(Object.keys(result.data).sort(), ['_id', 'email', 'name', 'role', 'token']);
+  assert.ok(result.data.token && result.data.refreshToken);
+  assert.ok(result.data._id && result.data.email && result.data.role);
   return result.data;
 }
 
@@ -101,7 +103,7 @@ before(async () => {
   assert.equal(mongoose.connection.name, testDatabase);
   const topology = await mongoose.connection.db.admin().command({ hello: 1 });
   assert.ok(topology.setName || topology.msg === 'isdbgrid', 'Integration tests require transaction-capable MongoDB');
-  for (const model of [User, Bus, Route, Stop, Booking, Report, RouteAlert, SafetySession, Shift]) await model.init();
+  for (const model of [User, Bus, Route, Stop, Booking, Report, RouteAlert, SafetySession, Shift, Seat]) await model.init();
   const admin = await User.create({ name: 'Integration Admin', email: 'admin@integration.example', password, role: 'admin' });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   baseUrl = 'http://127.0.0.1:' + server.address().port;
@@ -116,7 +118,7 @@ before(async () => {
   for (const number of ['INTEGRATION-A', 'INTEGRATION-B']) {
     const result = await request('/api/buses', adminToken, 'POST', { busNumber: number, route: route._id, capacity: 40 });
     assert.equal(result.status, 201);
-    assert.equal(result.data.availableSeats, 40);
+    assert.equal(Object.hasOwn(result.data, 'availableSeats'), false);
     assert.equal(result.data.direction, 'outbound');
     if (!busA) busA = result.data; else busB = result.data;
   }
@@ -144,9 +146,21 @@ test('normal commuter registration remains compatible', async () => {
   assert.equal(result.status, 201);
   assert.equal(result.data.role, 'commuter');
   assert.ok(result.data.token);
+  assert.ok(result.data.refreshToken);
   assert.equal(Object.hasOwn(result.data, 'password'), false);
   commuter = result.data;
   commuterToken = result.data.token;
+});
+
+test('refresh token rotation restores sessions and explicit logout revokes refresh', async () => {
+  const identity = await login(commuter.email);
+  const rotated = await request('/api/auth/refresh', null, 'POST', { refreshToken: identity.refreshToken });
+  assert.equal(rotated.status, 200);
+  assert.ok(rotated.data.token && rotated.data.refreshToken);
+  assert.equal((await request('/api/auth/profile', rotated.data.token)).status, 200);
+  assert.equal((await request('/api/auth/refresh', null, 'POST', { refreshToken: identity.refreshToken })).status, 401);
+  assert.equal((await request('/api/auth/logout', null, 'POST', { refreshToken: rotated.data.refreshToken })).status, 204);
+  assert.equal((await request('/api/auth/refresh', null, 'POST', { refreshToken: rotated.data.refreshToken })).status, 401);
 });
 
 for (const role of ['admin', 'driver']) {
@@ -246,6 +260,11 @@ test('assignment persists both records and remains compatible with populated fle
   assert.equal(saved.route.routeName, route.routeName);
   assert.equal((await profile(driverTokenA)).assignedBus, busA._id);
   assert.equal((await assign(busA, driverA)).status, 200);
+  await Bus.updateOne({ _id: busA._id }, { $set: { status: 'active' } });
+  const activeFlagOnly = await request('/api/buses/route/' + route._id + '/active');
+  assert.equal(activeFlagOnly.status, 200);
+  assert.deepEqual(activeFlagOnly.data, []);
+  await Bus.updateOne({ _id: busA._id }, { $set: { status: 'idle' } });
   const freshIdentity = await login(driverA.email);
   assert.equal((await profile(freshIdentity.token)).assignedBus, busA._id);
   assert.equal((await profile(freshIdentity.token)).assignedBus, busA._id);
@@ -343,11 +362,13 @@ test('bus creation with a driver synchronizes the profile and failures roll back
 });
 
 test('ordinary bus edits keep their contract and update operators cannot bypass assignment handling', async () => {
-  const result = await request('/api/buses/' + busA._id, adminToken, 'PUT', { availableSeats: 35, status: 'maintenance' });
+  const oldCounter = await request('/api/buses/' + busA._id, adminToken, 'PUT', { availableSeats: 35 });
+  assert.equal(oldCounter.status, 400);
+  const result = await request('/api/buses/' + busA._id, adminToken, 'PUT', { status: 'maintenance' });
   assert.equal(result.status, 200);
-  assert.equal(result.data.availableSeats, 35);
   assert.equal(result.data.status, 'maintenance');
   assert.equal(result.data.driver, null);
+  await request('/api/buses/' + busA._id, adminToken, 'PUT', { status: 'idle' });
   assert.equal((await request('/api/buses/' + busA._id, adminToken, 'PUT', { $set: { driver: driverA._id } })).status, 400);
   await assertLinks(busA, null);
 });
@@ -400,6 +421,11 @@ test('driver shifts are assigned-bus-only, persistent and safe under concurrent 
   assert.equal(String(success.shift.driver._id), driverA._id);
   assert.equal(String(success.shift.route._id), route._id);
   assert.equal(await Shift.countDocuments({ driver: driverA._id, status: 'active' }), 1);
+  const passengerBuses = await request('/api/buses/route/' + route._id + '/active');
+  assert.equal(passengerBuses.status, 200);
+  assert.deepEqual(passengerBuses.data.map(item => String(item._id)), [busA._id]);
+  const adminFleet = await request('/api/buses');
+  assert.equal(adminFleet.data.find(item => String(item._id) === busA._id).operating, true);
 
   const refreshedProfile = await profile(driverTokenA);
   assert.equal(refreshedProfile.activeShift.status, 'active');
@@ -414,6 +440,15 @@ test('driver shifts are assigned-bus-only, persistent and safe under concurrent 
   assert.equal(adminShifts.status, 200);
   assert.equal(adminShifts.data.length, 1);
   assert.equal((await request('/api/admin/shifts', driverTokenA)).status, 403);
+
+  assert.equal((await assign(busB, driverB)).status, 200);
+  assert.equal((await request(startEndpoint, driverTokenB, 'POST')).status, 201);
+  const twoBuses = await request('/api/buses/route/' + route._id + '/active');
+  assert.equal(twoBuses.data.length, 2);
+  await request('/api/buses/assigned/end-shift', driverTokenB, 'POST');
+  assert.equal((await assign(busB, null)).status, 200);
+  const missingRoute = await request('/api/buses/route/' + new mongoose.Types.ObjectId() + '/active');
+  assert.deepEqual(missingRoute.data, []);
 });
 
 test('return trip is assigned-driver-only, terminal-gated, atomic and direction-aware', async () => {
@@ -522,12 +557,12 @@ test('existing GPS, real Socket.IO delivery, ETA, seats, bookings, routes and an
     assert.equal(location.data.status, 'active');
     assert.ok(location.data.nextStop && location.data.etaMinutes > 0);
     assert.equal((await request('/api/buses/' + busA._id + '/eta')).status, 200);
-    assert.equal((await request('/api/buses/' + busA._id + '/seats', driverTokenA, 'PATCH', { availableSeats: 34 })).status, 200);
+    assert.equal((await request('/api/buses/' + busA._id + '/seats', driverTokenA, 'PATCH', { availableSeats: 34 })).status, 410);
     assert.equal((await profile(driverTokenA)).assignedBus, busA._id);
     const booking = await request('/api/bookings', commuterToken, 'POST', { bus: busA._id, seatNumber: '1', fare: 10 });
     assert.equal(booking.status, 201);
     assert.equal((await request('/api/bookings/' + booking.data._id + '/cancel', commuterToken, 'PATCH')).status, 200);
-    assert.equal((await request('/api/buses/' + busA._id)).data.availableSeats, 34);
+    assert.equal((await request('/api/buses/' + busA._id + '/seats')).data.available, 40);
     for (const path of ['/api/routes', '/api/routes/' + route._id, '/api/stops/route/' + route._id, '/api/route-alerts/route/' + route._id]) assert.equal((await request(path)).status, 200);
     for (const path of ['/api/admin/overview', '/api/admin/analytics/bookings', '/api/admin/analytics/occupancy', '/api/admin/analytics/reports', '/api/admin/shifts', '/api/reports']) assert.equal((await request(path, adminToken)).status, 200);
     assert.equal((await request('/api/bookings/me', commuterToken)).status, 200);
@@ -538,11 +573,11 @@ test('existing GPS, real Socket.IO delivery, ETA, seats, bookings, routes and an
 });
 
 test('route-first and manual bookings resolve only valid active assignments and protect seats/payment state', async () => {
-  const seatsBefore = (await Bus.findById(busA._id)).availableSeats;
+  const seatsBefore = await Seat.countDocuments({ bus: busA._id, status: 'available' });
 
   const fakePaid = await request('/api/bookings', commuterToken, 'POST', {
     routeId: route._id,
-    seatNumber: 'RF-FAKE',
+    seatNumber: '1',
     paymentMethod: 'online',
     paymentStatus: 'paid',
     amount: 1,
@@ -551,7 +586,7 @@ test('route-first and manual bookings resolve only valid active assignments and 
 
   const created = await request('/api/bookings', commuterToken, 'POST', {
     routeId: route._id,
-    seatNumber: 'RF-1',
+    seatNumber: '1',
     paymentMethod: 'online',
     fare: 1,
   });
@@ -563,11 +598,11 @@ test('route-first and manual bookings resolve only valid active assignments and 
   assert.equal(routeFirstBooking.fare, 50);
   assert.equal(routeFirstBooking.currency, 'PKR');
   assert.equal(routeFirstBooking.paymentStatus, 'pending');
-  assert.equal((await Bus.findById(busA._id)).availableSeats, seatsBefore - 1);
+  assert.equal(await Seat.countDocuments({ bus: busA._id, shift: routeFirstBooking.shift, status: 'available' }), seatsBefore - 1);
 
   const duplicate = await request('/api/bookings', commuterToken, 'POST', {
     routeId: route._id,
-    seatNumber: 'RF-OTHER',
+    seatNumber: '2',
   });
   assert.equal(duplicate.status, 409);
 
@@ -583,7 +618,7 @@ test('route-first and manual bookings resolve only valid active assignments and 
     routeId: route._id,
     bus: busA._id,
     driverId: driverB._id,
-    seatNumber: 'RF-2',
+    seatNumber: '2',
   });
   assert.equal(wrongDriver.status, 400);
 
@@ -591,7 +626,7 @@ test('route-first and manual bookings resolve only valid active assignments and 
     routeId: route._id,
     bus: busA._id,
     driverId: driverA._id,
-    seatNumber: 'RF-1',
+    seatNumber: '1',
   });
   assert.equal(occupiedSeat.status, 409);
 
@@ -599,7 +634,7 @@ test('route-first and manual bookings resolve only valid active assignments and 
     routeId: route._id,
     bus: busA._id,
     driverId: driverA._id,
-    seatNumber: 'RF-2',
+    seatNumber: '2',
     fare: 0,
   });
   assert.equal(manual.status, 201);
@@ -609,7 +644,38 @@ test('route-first and manual bookings resolve only valid active assignments and 
     (await request('/api/bookings/' + manual.data._id + '/cancel', manualToken, 'PATCH')).status,
     200
   );
-  assert.equal((await Bus.findById(busA._id)).availableSeats, seatsBefore - 1);
+  assert.equal(await Seat.countDocuments({ bus: busA._id, shift: routeFirstBooking.shift, status: 'available' }), seatsBefore - 1);
+});
+
+test('seat reservation race yields one winner and driver/passenger seat states sync', async () => {
+  const suffix = crypto.randomBytes(5).toString('hex');
+  const [passengerA, passengerB] = await Promise.all(['a', 'b'].map(async label => {
+    const result = await request('/api/auth/register', null, 'POST', { name: `Race Passenger ${label.toUpperCase()}`, email: `race.${label}.${suffix}@integration.example`, password });
+    assert.equal(result.status, 201); return result.data;
+  }));
+  const makeBooking = token => request('/api/bookings', token, 'POST', { routeId: route._id, bus: busA._id, seatNumber: '39', paymentMethod: 'cash' });
+  const attempts = await Promise.all([makeBooking(passengerA.token), makeBooking(passengerB.token)]);
+  assert.deepEqual(attempts.map(r => r.status).sort(), [201, 409]);
+  assert.match(attempts.find(r => r.status === 409).data.message, /seat was just taken/i);
+  const winning = attempts.find(r => r.status === 201).data;
+  const driverMap = await request('/api/buses/assigned/seats', driverTokenA);
+  const reserved = driverMap.data.seats.find(seat => seat.seatNumber === '39');
+  assert.equal(reserved.status, 'reserved');
+  assert.ok(reserved.passengerName);
+  const passengerMap = await request('/api/buses/' + busA._id + '/seats');
+  assert.equal(passengerMap.data.seats.find(seat => seat.seatNumber === '39').status, 'reserved');
+  assert.equal((await request('/api/buses/assigned/seats/39', driverTokenA, 'PATCH', { action: 'board' })).status, 200);
+  assert.equal((await request('/api/buses/' + busA._id + '/seats')).data.seats.find(seat => seat.seatNumber === '39').status, 'occupied');
+  assert.equal((await Booking.findById(winning._id)).status, 'boarded');
+  assert.equal((await request('/api/buses/assigned/seats/39', driverTokenA, 'PATCH', { action: 'release' })).status, 200);
+  assert.equal((await Booking.findById(winning._id)).status, 'completed');
+
+  const currentSeats = (await request('/api/buses/' + busA._id + '/seats')).data.seats;
+  const lowestFree = currentSeats.filter(seat => seat.status === 'available').map(seat => Number(seat.seatNumber)).sort((a,b) => a-b)[0];
+  const walkIn = await request('/api/buses/assigned/seats/walk-in', driverTokenA, 'POST');
+  assert.equal(walkIn.status, 201);
+  assert.equal(Number(walkIn.data.seat.seatNumber), lowestFree);
+  assert.equal((await request('/api/buses/assigned/seats/' + walkIn.data.seat.seatNumber, driverTokenA, 'PATCH', { action: 'release' })).status, 200);
 });
 
 test('consensual passenger locations reach only the assigned active driver and stop on cancellation', async () => {
@@ -680,7 +746,7 @@ test('consensual passenger locations reach only the assigned active driver and s
     });
     const booking = await request('/api/bookings', passengerToken, 'POST', {
       routeId: route._id,
-      seatNumber: 'LOC-1',
+      seatNumber: '4',
       pickupLocation: {
         latitude: 31.418,
         longitude: 73.079,
@@ -809,15 +875,15 @@ test('signed payment notifications verify success/failure and release failed boo
     password,
   });
   assert.equal(failureIdentity.status, 201);
-  const seatsBefore = (await Bus.findById(busA._id)).availableSeats;
+  const seatsBefore = await Seat.countDocuments({ bus: busA._id, shift: routeFirstBooking.shift, status: 'available' });
   const pending = await request('/api/bookings', failureIdentity.data.token, 'POST', {
     routeId: route._id,
-    seatNumber: 'PAY-FAIL',
+    seatNumber: '3',
     paymentMethod: 'online',
   });
   assert.equal(pending.status, 201);
   assert.equal(pending.data.paymentStatus, 'pending');
-  assert.equal((await Bus.findById(busA._id)).availableSeats, seatsBefore - 1);
+  assert.equal(await Seat.countDocuments({ bus: busA._id, shift: routeFirstBooking.shift, status: 'available' }), seatsBefore - 1);
 
   const failureNotification = {
     paymentReference: pending.data.paymentReference,
@@ -847,7 +913,7 @@ test('signed payment notifications verify success/failure and release failed boo
   assert.equal(failed.status, 200);
   assert.equal(failed.data.booking.paymentStatus, 'failed');
   assert.equal(failed.data.booking.status, 'cancelled');
-  assert.equal((await Bus.findById(busA._id)).availableSeats, seatsBefore);
+  assert.equal(await Seat.countDocuments({ bus: busA._id, shift: routeFirstBooking.shift, status: 'available' }), seatsBefore);
 });
 test('ending a shift is atomic, disables GPS and preserves completed history', async () => {
   const endpoint = '/api/buses/assigned/end-shift';
@@ -874,6 +940,8 @@ test('ending a shift is atomic, disables GPS and preserves completed history', a
   const socket = createSocket(baseUrl, { transports: ['websocket'], reconnection: false, timeout: 5000 });
   await new Promise((resolve, reject) => { socket.once('connect', resolve); socket.once('connect_error', reject); });
   socket.emit('watchBus', busA._id);
+  const passengerSubscription = await new Promise(resolve => socket.emit('watchPassengerBookings', { token: commuterToken }, resolve));
+  assert.equal(passengerSubscription.ok, true);
   for (let n = 0; n < 100 && !io.sockets.adapter.rooms.has('bus:' + busA._id); n++) await delay(25);
   const driverSubscription = await new Promise((resolve) => {
     socket.emit('watchDriverBookings', { token: driverTokenA }, resolve);
@@ -890,17 +958,23 @@ test('ending a shift is atomic, disables GPS and preserves completed history', a
     const timeout = setTimeout(() => reject(new Error('End-shift status event not delivered')), 8000);
     socket.once('locationUpdate', (event) => { clearTimeout(timeout); resolve(event); });
   });
+  const cancelledByService = new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error('Shift-end cancellation was not sent to the passenger')), 8000);
+    socket.once('bookingStatusUpdate', event => { clearTimeout(timeout); resolve(event); });
+  });
 
   const attempts = await Promise.all([
     request(endpoint, driverTokenA, 'POST'),
     request(endpoint, driverTokenA, 'POST'),
   ]);
-  assert.deepEqual(attempts.map((result) => result.status).sort(), [200, 409]);
+  assert.deepEqual(attempts.map((result) => result.status).sort(), [200, 200]);
   const success = attempts.find((result) => result.status === 200).data;
   assert.equal(success.message, 'Shift ended successfully');
   assert.equal(success.shift.status, 'completed');
   assert.ok(success.shift.endedAt);
   assert.equal(success.shift.bus.status, 'idle');
+  const serviceCancellation = await cancelledByService;
+  assert.equal(serviceCancellation.status, 'cancelled_by_service');
 
   const endEvent = await statusEvent;
   assert.equal(endEvent.busId, busA._id);
@@ -916,17 +990,19 @@ test('ending a shift is atomic, disables GPS and preserves completed history', a
   assert.equal(await Shift.countDocuments({ driver: driverA._id }), 1);
   assert.equal((await Bus.findById(busA._id)).status, 'idle');
   assert.equal((await Booking.findById(routeFirstBooking._id)).locationSharingActive, false);
+  assert.equal((await Booking.findById(routeFirstBooking._id)).status, 'cancelled_by_service');
   assert.equal((await profile(driverTokenA)).activeShift, null);
   const commuterFleet = await request('/api/buses');
   assert.equal(commuterFleet.status, 200);
   const endedBus = commuterFleet.data.find((bus) => bus._id === busA._id);
   assert.equal(endedBus.status, 'idle');
+  assert.deepEqual((await request('/api/buses/route/' + route._id + '/active')).data.filter(bus => String(bus._id) === busA._id), []);
 
   const rejectedLocation = await request('/api/buses/' + busA._id + '/location', driverTokenA, 'PATCH', { latitude: 31.42, longitude: 73.082 });
   assert.equal(rejectedLocation.status, 409);
   const duplicateEnd = await request(endpoint, driverTokenA, 'POST');
-  assert.equal(duplicateEnd.status, 409);
-  assert.equal(duplicateEnd.data.message, 'No active shift found.');
+  assert.equal(duplicateEnd.status, 200);
+  assert.equal(String(duplicateEnd.data.shift._id), String(success.shift._id));
 
   const adminShifts = await request('/api/admin/shifts', adminToken);
   const completed = adminShifts.data.find((shift) => shift._id === success.shift._id);

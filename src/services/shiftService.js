@@ -2,6 +2,7 @@ const User = require('../models/User');
 const Bus = require('../models/Bus');
 const Shift = require('../models/Shift');
 const Booking = require('../models/Booking');
+const Seat = require('../models/Seat');
 const { ApiError } = require('../utils/apiError');
 const { runInTransaction } = require('./transactionService');
 
@@ -27,9 +28,11 @@ async function startDriverShift(driverId) {
       if (!bus) throw new ApiError(404, 'Assigned bus not found.');
       if (!sameId(bus.driver, driver._id)) throw new ApiError(403, 'Forbidden: this bus is not assigned to you.');
       if (!bus.route) throw new ApiError(400, 'No route assigned.');
+      if (bus.status === 'maintenance') throw new ApiError(409, 'This bus is under maintenance and cannot start a shift.');
 
       const activeShift = await Shift.findOne({
         status: 'active',
+        endedAt: null,
         $or: [{ driver: driver._id }, { bus: bus._id }],
       }).session(session);
       if (activeShift) throw new ApiError(409, 'An active shift already exists for this driver or bus.');
@@ -48,6 +51,7 @@ async function startDriverShift(driverId) {
         startDirection: bus.direction,
         startedAt: new Date(),
       }], { session });
+      await Seat.insertMany(Array.from({ length: bus.capacity }, (_, index) => ({ bus: bus._id, shift: shift._id, seatNumber: String(index + 1), status: 'available' })), { session });
 
       return shift._id;
     });
@@ -60,7 +64,7 @@ async function startDriverShift(driverId) {
 }
 
 async function endDriverShift(driverId) {
-  const shiftId = await runInTransaction(async (session) => {
+  const ending = await runInTransaction(async (session) => {
     const driver = await User.findOne({ _id: driverId, role: 'driver' }).select('assignedBus').session(session);
     if (!driver) throw new ApiError(403, 'Forbidden: driver access is required.');
     if (!driver.assignedBus) throw new ApiError(400, 'No bus assigned.');
@@ -69,29 +73,37 @@ async function endDriverShift(driverId) {
     if (!bus) throw new ApiError(404, 'Assigned bus not found.');
     if (!sameId(bus.driver, driver._id)) throw new ApiError(403, 'Forbidden: this bus is not assigned to you.');
 
-    const shift = await Shift.findOne({ driver: driver._id, bus: bus._id, status: 'active' }).session(session);
-    if (!shift) throw new ApiError(409, 'No active shift found.');
+    const shift = await Shift.findOne({ driver: driver._id, bus: bus._id, status: 'active', endedAt: null }).session(session);
+    if (!shift) {
+      const previous = await Shift.findOne({ driver: driver._id, bus: bus._id, status: 'completed' }).sort({ endedAt: -1 }).session(session);
+      if (previous) return { shiftId: previous._id, cancelledPassengerIds: [] };
+      throw new ApiError(409, 'No active shift found.');
+    }
 
+    const cancelledPassengerIds = await Booking.find({ shift: shift._id, status: 'confirmed' }).distinct('user').session(session);
     shift.status = 'completed';
     shift.endedAt = new Date();
     bus.status = 'idle';
     await shift.save({ session });
     await bus.save({ session });
+    await Booking.updateMany({ shift: shift._id, status: 'confirmed' }, { $set: { status: 'cancelled_by_service', locationSharingActive: false, paymentStatus: 'cancelled' } }, { session });
+    await Booking.updateMany({ shift: shift._id, status: 'boarded' }, { $set: { status: 'completed', locationSharingActive: false } }, { session });
     await Booking.updateMany(
       {
         driver: driver._id,
         bus: bus._id,
         route: shift.route,
-        status: 'confirmed',
+        status: { $in: ['confirmed', 'boarded'] },
         locationSharingActive: true,
       },
       { $set: { locationSharingActive: false } },
       { session }
     );
-    return shift._id;
+    await Seat.updateMany({ shift: shift._id }, { $set: { status: 'available', booking: null } }, { session });
+    return { shiftId: shift._id, cancelledPassengerIds };
   });
 
-  return populatedShift(shiftId);
+  return { shift: await populatedShift(ending.shiftId), cancelledPassengerIds: ending.cancelledPassengerIds };
 }
 
 module.exports = { startDriverShift, endDriverShift };
