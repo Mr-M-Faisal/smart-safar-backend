@@ -8,7 +8,7 @@
     "test:unit": "node test/operating-bus-rules.test.js",
     "reconcile:operating-buses": "node src/scripts/reconcileOperatingBuses.js",
     "reconcile:operating-buses:apply": "node src/scripts/reconcileOperatingBuses.js --apply",
-    "dev": "nodemon src/server.js"
+    "dev": "node --watch src/server.js"
   },
   "keywords": [],
   "author": "",
@@ -20,11 +20,10 @@
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "jsonwebtoken": "^9.0.2",
-    "mongoose": "^8.5.0",
+    "mongoose": "^8.24.4",
     "socket.io": "^4.7.5"
   },
   "devDependencies": {
-    "nodemon": "^3.1.14",
     "socket.io-client": "^4.8.3"
   }
 }

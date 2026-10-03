@@ -5,6 +5,7 @@ const http = require('http');
 const jwt = require('jsonwebtoken');
 const { randomUUID } = require('crypto');
 const { Server } = require('socket.io');
+const { apiRateLimiter } = require('./middleware/rateLimit');
 const connectDB = require('./config/db');
 const { activeDriverContext } = require('./services/bookingService');
 const { closeStaleShifts } = require('./services/staleShiftService');
@@ -12,20 +13,35 @@ const User = require('./models/User');
 
 const app = express();
 const server = http.createServer(app);
+app.disable('x-powered-by');
+app.set('trust proxy', 'loopback');
+
 const io = new Server(server, {
   cors: { origin: '*' },
+  maxHttpBufferSize: 64 * 1024,
 });
 
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('X-Permitted-Cross-Domain-Policies', 'none');
+  res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+  if (process.env.NODE_ENV === 'production') {
+    res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  }
+  next();
+});
 app.use(cors());
 app.use((req, res, next) => {
   req.id = randomUUID();
   res.setHeader('X-Request-Id', req.id);
   res.on('finish', () => {
-    if (res.statusCode >= 500) console.error(JSON.stringify({ requestId: req.id, method: req.method, path: req.originalUrl, status: res.statusCode }));
+    if (res.statusCode >= 500) console.error(JSON.stringify({ requestId: req.id, method: req.method, path: req.path, status: res.statusCode }));
   });
   next();
 });
-app.use(express.json());
+app.use(express.json({ limit: '64kb', strict: true }));
 
 // Make io accessible inside controllers via req.app.get('io')
 app.set('io', io);
@@ -34,6 +50,7 @@ app.get('/', (req, res) => {
   res.json({ message: 'Smart Public Transit Tracking System API is running' });
 });
 
+app.use('/api', apiRateLimiter);
 app.use('/api/auth', require('./routes/authRoutes'));
 app.use('/api/routes', require('./routes/routeRoutes'));
 app.use('/api/stops', require('./routes/stopRoutes'));
@@ -63,7 +80,7 @@ io.on('connection', (socket) => {
       const suppliedToken = typeof payload.token === 'string' ? payload.token : socket.handshake.auth?.token;
       const token = suppliedToken?.replace(/^Bearer\s+/i, '');
       if (!token) throw new Error('Missing token.');
-      const decoded = jwt.verify(token, process.env.JWT_SECRET);
+      const decoded = jwt.verify(token, process.env.JWT_SECRET, { algorithms: ['HS256'] });
       if (decoded.role !== 'commuter' || !await User.exists({ _id: decoded.id, role: 'commuter' })) throw new Error('Passenger authentication required.');
       const room = `passenger:${decoded.id}`;
       await socket.join(room);
@@ -81,7 +98,7 @@ io.on('connection', (socket) => {
       const token = suppliedToken?.replace(/^Bearer\s+/i, '');
       if (!token) throw new Error('Missing token.');
 
-      const decoded = jwt.verify(token, process.env.JWT_SECRET);
+      const decoded = jwt.verify(token, process.env.JWT_SECRET, { algorithms: ['HS256'] });
       const { driver, bus } = await activeDriverContext(decoded.id);
       const room = `driver:${driver._id}`;
 

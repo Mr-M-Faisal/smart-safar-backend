@@ -1,4 +1,5 @@
 const RouteAlert = require('../models/RouteAlert');
+const { sendApiError } = require('../utils/apiError');
 
 // @route   POST /api/route-alerts
 const createRouteAlert = async (req, res) => {
@@ -12,7 +13,7 @@ const createRouteAlert = async (req, res) => {
     const alert = await RouteAlert.create({ route, message, expiresAt: expiresAt || null });
     res.status(201).json(alert);
   } catch (err) {
-    res.status(500).json({ message: 'Server error creating route alert', error: err.message });
+    sendApiError(res, err, 'Could not create route alert.');
   }
 };
 
@@ -27,7 +28,7 @@ const getAlertsByRoute = async (req, res) => {
 
     res.status(200).json(alerts);
   } catch (err) {
-    res.status(500).json({ message: 'Server error fetching route alerts', error: err.message });
+    sendApiError(res, err, 'Could not load route alerts.');
   }
 };
 
@@ -40,7 +41,7 @@ const deleteRouteAlert = async (req, res) => {
     }
     res.status(200).json({ message: 'Route alert deleted' });
   } catch (err) {
-    res.status(500).json({ message: 'Server error deleting route alert', error: err.message });
+    sendApiError(res, err, 'Could not delete route alert.');
   }
 };
 

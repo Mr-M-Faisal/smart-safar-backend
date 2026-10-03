@@ -7,7 +7,7 @@ const generateToken = (userId, role) => {
   return jwt.sign(
     { id: userId, role },
     process.env.JWT_SECRET,
-    { expiresIn: process.env.JWT_ACCESS_EXPIRES_IN || '15m' }
+    { expiresIn: process.env.JWT_ACCESS_EXPIRES_IN || '15m', algorithm: 'HS256' }
   );
 };
 

@@ -2,10 +2,10 @@ const mongoose = require('mongoose');
 
 const routeSchema = new mongoose.Schema(
   {
-    routeName: { type: String, required: true, trim: true },
-    startPoint: { type: String, required: true },
-    endPoint: { type: String, required: true },
-    description: { type: String, default: '' },
+    routeName: { type: String, required: true, trim: true, maxlength: 100 },
+    startPoint: { type: String, required: true, trim: true, maxlength: 100 },
+    endPoint: { type: String, required: true, trim: true, maxlength: 100 },
+    description: { type: String, trim: true, maxlength: 500, default: '' },
     isActive: { type: Boolean, default: true },
   },
   { timestamps: true }

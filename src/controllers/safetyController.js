@@ -1,5 +1,6 @@
 const SafetySession = require('../models/SafetySession');
 const Bus = require('../models/Bus');
+const { sendApiError } = require('../utils/apiError');
 
 // @route   POST /api/safety/sessions
 // @desc    Start sharing a live trip (generates a shareable link)
@@ -27,7 +28,7 @@ const startSession = async (req, res) => {
       startedAt: session.startedAt,
     });
   } catch (err) {
-    res.status(500).json({ message: 'Server error starting safety session', error: err.message });
+    sendApiError(res, err, 'Could not start trip sharing.');
   }
 };
 
@@ -59,7 +60,7 @@ const trackSession = async (req, res) => {
       startedAt: session.startedAt,
     });
   } catch (err) {
-    res.status(500).json({ message: 'Server error fetching shared trip', error: err.message });
+    sendApiError(res, err, 'Could not load shared trip details.');
   }
 };
 
@@ -83,7 +84,7 @@ const endSession = async (req, res) => {
 
     res.status(200).json({ message: 'Trip sharing ended', session });
   } catch (err) {
-    res.status(500).json({ message: 'Server error ending safety session', error: err.message });
+    sendApiError(res, err, 'Could not end trip sharing.');
   }
 };
 
@@ -97,7 +98,7 @@ const getMySessions = async (req, res) => {
       .sort({ createdAt: -1 });
     res.status(200).json(sessions);
   } catch (err) {
-    res.status(500).json({ message: 'Server error fetching sessions', error: err.message });
+    sendApiError(res, err, 'Could not load trip sharing sessions.');
   }
 };
 

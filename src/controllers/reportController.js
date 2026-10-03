@@ -1,4 +1,5 @@
 const Report = require('../models/Report');
+const { sendApiError } = require('../utils/apiError');
 
 // @route   POST /api/reports
 const createReport = async (req, res) => {
@@ -16,7 +17,7 @@ const createReport = async (req, res) => {
     const report = await Report.create({ user: userId, bus, reportType, description });
     res.status(201).json(report);
   } catch (err) {
-    res.status(500).json({ message: 'Server error creating report', error: err.message });
+    sendApiError(res, err, 'Could not create report.');
   }
 };
 
@@ -34,7 +35,7 @@ const getReports = async (req, res) => {
 
     res.status(200).json(reports);
   } catch (err) {
-    res.status(500).json({ message: 'Server error fetching reports', error: err.message });
+    sendApiError(res, err, 'Could not load reports.');
   }
 };
 
@@ -54,7 +55,7 @@ const updateReportStatus = async (req, res) => {
 
     res.status(200).json(report);
   } catch (err) {
-    res.status(500).json({ message: 'Server error updating report status', error: err.message });
+    sendApiError(res, err, 'Could not update report status.');
   }
 };
 

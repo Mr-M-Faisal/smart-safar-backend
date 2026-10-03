@@ -41,7 +41,7 @@ const getFleetOverview = async (req, res) => {
       activeShifts,
     });
   } catch (err) {
-    res.status(500).json({ message: 'Server error fetching fleet overview', error: err.message });
+    sendApiError(res, err, 'Could not load fleet overview.');
   }
 };
 
@@ -76,7 +76,7 @@ const getBookingsAnalytics = async (req, res) => {
 
     res.status(200).json(results);
   } catch (err) {
-    res.status(500).json({ message: 'Server error fetching booking analytics', error: err.message });
+    sendApiError(res, err, 'Could not load booking analytics.');
   }
 };
 
@@ -94,7 +94,7 @@ const getOccupancyByRoute = async (req, res) => {
     }));
     res.status(200).json(results);
   } catch (err) {
-    res.status(500).json({ message: 'Server error fetching occupancy analytics', error: err.message });
+    sendApiError(res, err, 'Could not load occupancy analytics.');
   }
 };
 
@@ -113,7 +113,7 @@ const getReportsSummary = async (req, res) => {
 
     res.status(200).json({ byStatus, byType });
   } catch (err) {
-    res.status(500).json({ message: 'Server error fetching reports summary', error: err.message });
+    sendApiError(res, err, 'Could not load reports summary.');
   }
 };
 
@@ -126,7 +126,7 @@ const getShifts = async (req, res) => {
       .sort({ startedAt: -1 });
     res.status(200).json(shifts);
   } catch (err) {
-    res.status(500).json({ message: 'Server error fetching shifts' });
+    sendApiError(res, err, 'Could not load shifts.');
   }
 };
 
@@ -177,7 +177,7 @@ const getAdminBookings = async (req, res) => {
       .sort({ createdAt: -1 }).limit(500);
     res.status(200).json(bookings);
   } catch (err) {
-    res.status(500).json({ message: 'Server error fetching bookings', error: err.message });
+    sendApiError(res, err, 'Could not load bookings.');
   }
 };
 
@@ -195,8 +195,7 @@ const cancelAdminBookingAction = async (req, res) => {
     }
     res.status(200).json({ message: 'Booking cancelled and seat released.', booking: result.booking });
   } catch (err) {
-    const status = err.statusCode || err.status || 500;
-    res.status(status).json({ message: err.message || 'Server error cancelling booking' });
+    sendApiError(res, err, 'Could not cancel booking.');
   }
 };
 
@@ -205,7 +204,7 @@ const getCommuters = async (req, res) => {
     const users = await User.find({ role: 'commuter' }).select('_id name email phone createdAt').sort({ createdAt: -1 }).limit(500).lean();
     res.status(200).json(users);
   } catch (err) {
-    res.status(500).json({ message: 'Server error fetching passenger accounts', error: err.message });
+    sendApiError(res, err, 'Could not load passenger accounts.');
   }
 };
 

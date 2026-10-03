@@ -1,10 +1,13 @@
 const { randomBytes } = require('crypto');
+const bcrypt = require('bcryptjs');
 const User = require('../models/User');
 const Shift = require('../models/Shift');
 const { getOperatingBusForDriver } = require('../services/operatingBusService');
 const { createSession, rotateSession, revokeSession } = require('../services/authSessionService');
 const { ApiError, sendApiError } = require('../utils/apiError');
 const { requireObjectBody, validateAccountFields } = require('../utils/accountValidation');
+
+const dummyPasswordHash = bcrypt.hashSync('smart-safar-invalid-account-password', 10);
 
 // @route   POST /api/auth/register
 // @access  Public (commuter accounts only)
@@ -38,8 +41,10 @@ const loginUser = async (req, res) => {
       throw new ApiError(400, 'Please provide all required fields');
     }
     const foundUser = await User.findOne({ email: email.trim().toLowerCase() });
-    if (!foundUser) throw new ApiError(400, 'User not found');
-    if (!(await foundUser.matchPassword(password))) throw new ApiError(400, 'Invalid credentials');
+    const passwordMatches = foundUser
+      ? await foundUser.matchPassword(password)
+      : await bcrypt.compare(password, dummyPasswordHash);
+    if (!foundUser || !passwordMatches) throw new ApiError(401, 'Invalid email or password.');
     const session = await createSession(foundUser);
     res.status(200).json({ _id: foundUser._id, name: foundUser.name, email: foundUser.email, role: foundUser.role, ...session });
   } catch (error) {
