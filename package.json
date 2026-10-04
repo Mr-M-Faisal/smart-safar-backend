@@ -2,8 +2,9 @@
   "name": "backend",
   "version": "1.0.0",
   "description": "",
-  "main": "index.js",
+  "main": "src/server.js",
   "scripts": {
+    "start": "node src/server.js",
     "test": "node --test --test-concurrency=1 test/driver-management.test.js test/operating-bus-rules.test.js",
     "test:unit": "node test/operating-bus-rules.test.js",
     "reconcile:operating-buses": "node src/scripts/reconcileOperatingBuses.js",
@@ -14,6 +15,9 @@
   "author": "",
   "license": "ISC",
   "type": "commonjs",
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
     "bcryptjs": "^2.4.3",
     "cors": "^2.8.5",
