@@ -19,8 +19,8 @@ app.set('trust proxy', 1);
 
 const allowedOrigins = process.env.CORS_ORIGIN
   ? process.env.CORS_ORIGIN.split(',').map(s => s.trim()).filter(Boolean)
-  : (process.env.NODE_ENV === 'production' ? [] : ['*']);
-const corsOrigin = allowedOrigins.includes('*') ? true : allowedOrigins;
+  : ['*'];
+const corsOrigin = allowedOrigins.includes('*') ? true : (allowedOrigins.length > 0 ? allowedOrigins : true);
 
 const io = new Server(server, {
   cors: { origin: corsOrigin },
