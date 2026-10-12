@@ -9,4 +9,6 @@ const routeAlertSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
+routeAlertSchema.index({ route: 1, createdAt: -1 });
+
 module.exports = mongoose.model('RouteAlert', routeAlertSchema);

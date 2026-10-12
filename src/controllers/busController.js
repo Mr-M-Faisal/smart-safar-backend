@@ -32,7 +32,7 @@ const sameId = (left, right) => left && right && left.toString() === right.toStr
 // - measures straight-line distance from the bus's current location
 // - divides by a 5-reading moving average of recent speeds
 const calculateNextStopAndETA = async (bus) => {
-  const storedStops = await Stop.find({ route: bus.route }).sort({ stopOrder: 1 });
+  const storedStops = await Stop.find({ route: bus.route }).sort({ stopOrder: 1 }).lean();
   const direction = getBusDirection(bus);
   const stops = getStopsInDirection(storedStops, direction);
 
@@ -160,15 +160,15 @@ const getBuses = async (req, res) => {
 
     const buses = await Bus.find(filter)
       .populate('route', 'routeName')
-      .populate('driver', 'name phone');
+      .populate('driver', 'name phone')
+      .lean();
 
-    const busIds = buses.map((bus) => bus._id);
     const routeIds = [...new Set(buses.map(bus => bus.route?._id || bus.route).filter(Boolean).map(String))];
     const operating = (await Promise.all(routeIds.map(id => getOperatingBusesForRoute(id)))).flat();
     const operatingById = new Map(operating.map(bus => [String(bus._id), bus]));
     res.status(200).json(buses.map(bus => {
       const active = operatingById.get(String(bus._id));
-      return { ...bus.toObject(), status: active ? 'active' : bus.status === 'maintenance' ? 'maintenance' : 'idle', shiftActive: Boolean(active), operating: Boolean(active), shiftId: active?.shiftId || null, availableSeats: active?.availableSeats ?? null };
+      return { ...bus, status: active ? 'active' : bus.status === 'maintenance' ? 'maintenance' : 'idle', shiftActive: Boolean(active), operating: Boolean(active), shiftId: active?.shiftId || null, availableSeats: active?.availableSeats ?? null };
     }));
   } catch (err) {
     sendApiError(res, err, 'Could not load buses.');

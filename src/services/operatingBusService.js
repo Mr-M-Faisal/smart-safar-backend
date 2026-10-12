@@ -14,12 +14,21 @@ async function getOperatingBusesForRoute(routeId, session = null) {
   if (session) query.session(session);
   const shifts = await query.lean();
   const operating = shifts.filter(shift => isOperatingShift(shift, routeId));
-  return Promise.all(operating.map(async shift => {
-    const seatQuery = Seat.countDocuments({ shift: shift._id, status: 'available' });
-    if (session) seatQuery.session(session);
-    const availableSeats = await seatQuery;
+  if (operating.length === 0) return [];
+
+  const shiftIds = operating.map(shift => shift._id);
+  const aggQuery = Seat.aggregate([
+    { $match: { shift: { $in: shiftIds }, status: 'available' } },
+    { $group: { _id: '$shift', availableCount: { $sum: 1 } } },
+  ]);
+  if (session) aggQuery.session(session);
+  const seatCounts = await aggQuery;
+  const countMap = new Map(seatCounts.map(item => [String(item._id), item.availableCount]));
+
+  return operating.map(shift => {
+    const availableSeats = countMap.get(String(shift._id)) || 0;
     return { ...shift.bus, shiftId: shift._id, shiftStartedAt: shift.startedAt, driver: shift.driver, shiftActive: true, operating: true, availableSeats };
-  }));
+  });
 }
 
 async function getOperatingBusForDriver(driverId, session = null) {

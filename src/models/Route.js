@@ -11,4 +11,6 @@ const routeSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
+routeSchema.index({ isActive: 1, createdAt: -1 });
+
 module.exports = mongoose.model('Route', routeSchema);

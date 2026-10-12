@@ -1,5 +1,6 @@
 require('dotenv').config();
 const express = require('express');
+const compression = require('compression');
 const cors = require('cors');
 const http = require('http');
 const jwt = require('jsonwebtoken');
@@ -32,6 +33,7 @@ app.use((req, res, next) => {
   }
   next();
 });
+app.use(compression());
 app.use(cors());
 app.use((req, res, next) => {
   req.id = randomUUID();

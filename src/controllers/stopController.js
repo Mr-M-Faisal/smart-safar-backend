@@ -55,7 +55,8 @@ async function createStop(req, res) {
 async function getStopsByRoute(req, res) {
   try {
     assertObjectId(req.params.routeId, 'Route ID');
-    const stops = await Stop.find({ route: req.params.routeId }).sort({ stopOrder: 1 });
+    const stops = await Stop.find({ route: req.params.routeId }).sort({ stopOrder: 1 }).lean();
+    res.setHeader('Cache-Control', 'public, max-age=15, stale-while-revalidate=30');
     return res.status(200).json(stops);
   } catch (error) {
     return sendApiError(res, error, 'Could not load route stops.');
@@ -65,8 +66,9 @@ async function getStopsByRoute(req, res) {
 async function getStopById(req, res) {
   try {
     assertObjectId(req.params.id, 'Stop ID');
-    const stop = await Stop.findById(req.params.id).populate('route', 'routeName');
+    const stop = await Stop.findById(req.params.id).populate('route', 'routeName').lean();
     if (!stop) return res.status(404).json({ message: 'Stop not found.' });
+    res.setHeader('Cache-Control', 'public, max-age=15, stale-while-revalidate=30');
     return res.status(200).json(stop);
   } catch (error) {
     return sendApiError(res, error, 'Could not load stop.');

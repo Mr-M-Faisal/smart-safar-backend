@@ -43,7 +43,8 @@ async function createRoute(req, res) {
 
 async function getRoutes(_req, res) {
   try {
-    const routes = await Route.find({ isActive: true }).sort({ createdAt: -1 });
+    const routes = await Route.find({ isActive: true }).sort({ createdAt: -1 }).lean();
+    res.setHeader('Cache-Control', 'public, max-age=15, stale-while-revalidate=30');
     return res.status(200).json(routes);
   } catch (error) {
     return sendApiError(res, error, 'Could not load routes.');
@@ -53,8 +54,9 @@ async function getRoutes(_req, res) {
 async function getRouteById(req, res) {
   try {
     assertObjectId(req.params.id, 'Route ID');
-    const route = await Route.findById(req.params.id);
+    const route = await Route.findById(req.params.id).lean();
     if (!route) return res.status(404).json({ message: 'Route not found.' });
+    res.setHeader('Cache-Control', 'public, max-age=15, stale-while-revalidate=30');
     return res.status(200).json(route);
   } catch (error) {
     return sendApiError(res, error, 'Could not load route.');

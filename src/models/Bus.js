@@ -63,5 +63,7 @@ const busSchema = new mongoose.Schema(
 );
 
 busSchema.index({ route: 1 });
+busSchema.index({ route: 1, status: 1 });
+busSchema.index({ driver: 1 }, { sparse: true });
 
 module.exports = mongoose.model("Bus", busSchema);
