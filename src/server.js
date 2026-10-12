@@ -17,8 +17,13 @@ const server = http.createServer(app);
 app.disable('x-powered-by');
 app.set('trust proxy', 1);
 
+const allowedOrigins = process.env.CORS_ORIGIN
+  ? process.env.CORS_ORIGIN.split(',').map(s => s.trim()).filter(Boolean)
+  : (process.env.NODE_ENV === 'production' ? [] : ['*']);
+const corsOrigin = allowedOrigins.includes('*') ? true : allowedOrigins;
+
 const io = new Server(server, {
-  cors: { origin: '*' },
+  cors: { origin: corsOrigin },
   maxHttpBufferSize: 64 * 1024,
 });
 
@@ -34,7 +39,7 @@ app.use((req, res, next) => {
   next();
 });
 app.use(compression());
-app.use(cors());
+app.use(cors({ origin: corsOrigin }));
 app.use((req, res, next) => {
   req.id = randomUUID();
   res.setHeader('X-Request-Id', req.id);

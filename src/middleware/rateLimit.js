@@ -38,7 +38,7 @@ function createRateLimiter({ windowMs, max, message, code = 'RATE_LIMITED', maxK
 
 const apiRateLimiter = createRateLimiter({
   windowMs: 15 * 60 * 1000,
-  max: 600,
+  max: 1500,
   message: 'Too many requests. Please wait and try again.',
 });
 
