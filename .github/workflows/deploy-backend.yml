@@ -33,12 +33,12 @@ jobs:
             -x "node_modules/.cache/*"
 
       - name: Deploy to Elastic Beanstalk
-        uses: einaregilsson/beanstalk-deploy@v22
-        with:
-          aws_access_key: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws_secret_key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          application_name: ${{ secrets.EB_APPLICATION_NAME }}
-          environment_name: ${{ secrets.EB_ENVIRONMENT_NAME }}
-          region: ${{ secrets.AWS_REGION }}
-          version_label: "gh-${{ github.run_number }}-${{ github.sha }}"
-          deployment_package: deploy.zip
+  uses: einaregilsson/beanstalk-deploy@v22
+  with:
+    aws_access_key: ${{ secrets.AWS_ACCESS_KEY_ID }}
+    aws_secret_key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+    application_name: "fyp-backend"
+    environment_name: "Fyp-backend-env"
+    version_label: ${{ github.sha }}
+    region: "eu-north-1"
+    deployment_package: "deploy.zip"
