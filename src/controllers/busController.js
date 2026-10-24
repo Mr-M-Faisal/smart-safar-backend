@@ -5,7 +5,7 @@ const User = require('../models/User');
 const { createFleetBus, updateFleetBus, deleteFleetBus } = require('../services/busAssignmentService');
 const { sendApiError } = require('../utils/apiError');
 const { haversineDistanceKm } = require('../utils/geo');
-const { getOperatingBusesForRoute, getOperatingBusForDriver } = require('../services/operatingBusService');
+const { getOperatingBusesForRoute, getOperatingBusesForBusIds, getOperatingBusForDriver } = require('../services/operatingBusService');
 const Seat = require('../models/Seat');
 const Booking = require('../models/Booking');
 const { runInTransaction } = require('../services/transactionService');
@@ -163,8 +163,7 @@ const getBuses = async (req, res) => {
       .populate('driver', 'name phone')
       .lean();
 
-    const routeIds = [...new Set(buses.map(bus => bus.route?._id || bus.route).filter(Boolean).map(String))];
-    const operating = (await Promise.all(routeIds.map(id => getOperatingBusesForRoute(id)))).flat();
+    const operating = await getOperatingBusesForBusIds(buses.map((bus) => bus._id));
     const operatingById = new Map(operating.map(bus => [String(bus._id), bus]));
     res.status(200).json(buses.map(bus => {
       const active = operatingById.get(String(bus._id));
@@ -295,10 +294,16 @@ const getBusETA = async (req, res) => {
 // @access  Private (driver)
 const updateBusLocation = async (req, res) => {
   try {
-    const { latitude, longitude, speed } = req.body;
-
-    if (latitude == null || longitude == null) {
-      return res.status(400).json({ message: 'latitude and longitude are required' });
+    const { latitude, longitude, speed } = req.body || {};
+    const capturedAt = req.body?.timestamp == null ? new Date() : new Date(req.body.timestamp);
+    if (!Number.isFinite(latitude) || latitude < -90 || latitude > 90 || !Number.isFinite(longitude) || longitude < -180 || longitude > 180) {
+      return res.status(400).json({ message: 'latitude and longitude must be valid numeric coordinates.', code: 'INVALID_COORDINATES' });
+    }
+    if (speed != null && (!Number.isFinite(speed) || speed < 0)) {
+      return res.status(400).json({ message: 'speed must be a non-negative number.', code: 'INVALID_SPEED' });
+    }
+    if (!Number.isFinite(capturedAt.getTime())) {
+      return res.status(400).json({ message: 'timestamp must be a valid date.', code: 'INVALID_LOCATION_TIMESTAMP' });
     }
 
     const bus = await Bus.findById(req.params.id);
@@ -312,13 +317,18 @@ const updateBusLocation = async (req, res) => {
     if (!operatingBus || !sameId(operatingBus._id, bus._id)) {
       return res.status(409).json({ message: 'Start an active shift before updating location.' });
     }
-    await Shift.updateOne({ _id: operatingBus.shiftId, status: 'active', endedAt: null }, { $set: { heartbeatAt: new Date() } });
+    const previousCapturedAt = bus.locationCapturedAt;
+    if (previousCapturedAt && capturedAt <= previousCapturedAt) {
+      return res.status(409).json({ message: 'A newer GPS update was already received.', code: 'STALE_LOCATION_UPDATE' });
+    }
 
     bus.currentLocation = { latitude, longitude };
-    bus.lastLocationUpdate = new Date();
+    const receivedAt = new Date();
+    bus.lastLocationUpdate = receivedAt;
+    bus.locationCapturedAt = capturedAt;
 
     // Maintain a rolling window of the last 5 speed readings
-    if (speed != null && !Number.isNaN(speed)) {
+    if (speed != null) {
       bus.recentSpeeds.push(speed);
       if (bus.recentSpeeds.length > 5) {
         bus.recentSpeeds.shift(); // drop the oldest reading
@@ -328,20 +338,34 @@ const updateBusLocation = async (req, res) => {
     // This also advances bus.currentStopIndex if the bus has arrived
     const etaInfo = await calculateNextStopAndETA(bus);
 
-    await bus.save();
+    const locationGuard = previousCapturedAt
+      ? { locationCapturedAt: { $lt: capturedAt } }
+      : { $or: [{ locationCapturedAt: null }, { locationCapturedAt: { $exists: false } }] };
+    const update = {
+      $set: {
+        currentLocation: bus.currentLocation,
+        lastLocationUpdate: receivedAt,
+        locationCapturedAt: capturedAt,
+        currentStopIndex: bus.currentStopIndex,
+      },
+    };
+    if (speed != null) update.$push = { recentSpeeds: { $each: [speed], $slice: -5 } };
+    const savedBus = await Bus.findOneAndUpdate({ _id: bus._id, ...locationGuard }, update, { new: true, runValidators: true });
+    if (!savedBus) return res.status(409).json({ message: 'A newer GPS update was already received.', code: 'STALE_LOCATION_UPDATE' });
+    await Shift.updateOne({ _id: operatingBus.shiftId, status: 'active', endedAt: null }, { $set: { heartbeatAt: receivedAt } });
 
     // Broadcast this update (now including ETA) to anyone watching this bus
     const io = req.app.get('io');
-    io.to(`bus:${bus._id}`).emit('locationUpdate', {
-      busId: bus._id,
+    io.to(`bus:${savedBus._id}`).emit('locationUpdate', {
+      busId: savedBus._id,
       latitude,
       longitude,
-      lastLocationUpdate: bus.lastLocationUpdate,
-      status: bus.status,
+      lastLocationUpdate: savedBus.lastLocationUpdate,
+      status: savedBus.status,
       ...etaInfo,
     });
 
-    res.status(200).json({ ...bus.toObject(), ...etaInfo });
+    res.status(200).json({ ...savedBus.toObject(), ...etaInfo });
   } catch (err) {
     sendApiError(res, err, 'Could not update the bus location.');
   }

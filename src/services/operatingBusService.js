@@ -8,7 +8,7 @@ const { isOperatingShift } = require('./operatingBusRules');
 // route, bus, driver, and driver's assignedBus all still agree.
 async function getOperatingBusesForRoute(routeId, session = null) {
   const query = Shift.find({ route: routeId, status: 'active', endedAt: null })
-    .populate('bus', 'busNumber route driver capacity status currentLocation lastLocationUpdate direction currentStopIndex recentSpeeds')
+    .populate('bus', 'busNumber route driver capacity status currentLocation lastLocationUpdate locationCapturedAt direction currentStopIndex recentSpeeds')
     .populate('driver', 'name role assignedBus')
     .sort({ startedAt: 1, _id: 1 });
   if (session) query.session(session);
@@ -31,6 +31,27 @@ async function getOperatingBusesForRoute(routeId, session = null) {
   });
 }
 
+async function getOperatingBusesForBusIds(busIds, session = null) {
+  if (!busIds?.length) return [];
+  const query = Shift.find({ bus: { $in: busIds }, status: 'active', endedAt: null })
+    .populate('bus', 'busNumber route driver capacity status currentLocation lastLocationUpdate locationCapturedAt direction currentStopIndex recentSpeeds')
+    .populate('driver', 'name role assignedBus')
+    .sort({ startedAt: 1, _id: 1 });
+  if (session) query.session(session);
+  const shifts = await query.lean();
+  const operating = shifts.filter((shift) => isOperatingShift(shift, shift.route));
+  if (!operating.length) return [];
+
+  const shiftIds = operating.map((shift) => shift._id);
+  const aggregate = Seat.aggregate([
+    { $match: { shift: { $in: shiftIds }, status: 'available' } },
+    { $group: { _id: '$shift', availableCount: { $sum: 1 } } },
+  ]);
+  if (session) aggregate.session(session);
+  const counts = new Map((await aggregate).map((item) => [String(item._id), item.availableCount]));
+  return operating.map((shift) => ({ ...shift.bus, shiftId: shift._id, shiftStartedAt: shift.startedAt, driver: shift.driver, shiftActive: true, operating: true, availableSeats: counts.get(String(shift._id)) || 0 }));
+}
+
 async function getOperatingBusForDriver(driverId, session = null) {
   const assignedQuery = User.findOne({ _id: driverId, role: 'driver' }).select('assignedBus');
   if (session) assignedQuery.session(session);
@@ -44,4 +65,4 @@ async function getOperatingBusForDriver(driverId, session = null) {
   return buses.find(item => String(item._id) === String(bus._id)) || null;
 }
 
-module.exports = { getOperatingBusesForRoute, getOperatingBusForDriver };
+module.exports = { getOperatingBusesForRoute, getOperatingBusesForBusIds, getOperatingBusForDriver };

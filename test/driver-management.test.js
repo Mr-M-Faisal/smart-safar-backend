@@ -38,7 +38,7 @@ async function request(path, token, method = 'GET', body, extraHeaders = {}) {
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     signal: AbortSignal.timeout(45000),
   });
-  return { status: response.status, data: response.status === 204 ? null : await response.json() };
+  return { status: response.status, headers: Object.fromEntries(response.headers.entries()), data: response.status === 204 ? null : await response.json() };
 }
 
 function paymentSignature(body) {
@@ -544,13 +544,23 @@ test('existing GPS, real Socket.IO delivery, ETA, seats, bookings, routes and an
     socket.emit('watchBus', busA._id);
     for (let n = 0; n < 100 && !io.sockets.adapter.rooms.has('bus:' + busA._id); n++) await delay(25);
     assert.ok(io.sockets.adapter.rooms.has('bus:' + busA._id));
+    const badCoordinates = await request('/api/buses/' + busA._id + '/location', driverTokenA, 'PATCH', { latitude: '31.4', longitude: 73.08 });
+    assert.equal(badCoordinates.status, 400);
+    assert.equal(badCoordinates.data.code, 'INVALID_COORDINATES');
+    const badSpeed = await request('/api/buses/' + busA._id + '/location', driverTokenA, 'PATCH', { latitude: 31.4, longitude: 73.08, speed: 'fast' });
+    assert.equal(badSpeed.status, 400);
+    assert.equal(badSpeed.data.code, 'INVALID_SPEED');
     let timeout;
     const update = new Promise((resolve, reject) => {
       timeout = setTimeout(() => reject(new Error('Location event not delivered')), 8000);
       socket.once('locationUpdate', (event) => { clearTimeout(timeout); resolve(event); });
     });
-    const location = await request('/api/buses/' + busA._id + '/location', driverTokenA, 'PATCH', { latitude: 31.418, longitude: 73.079, speed: 15 });
+    const timestamp = new Date().toISOString();
+    const location = await request('/api/buses/' + busA._id + '/location', driverTokenA, 'PATCH', { latitude: 31.418, longitude: 73.079, speed: 15, timestamp });
     assert.equal(location.status, 200);
+    const staleLocation = await request('/api/buses/' + busA._id + '/location', driverTokenA, 'PATCH', { latitude: 31.419, longitude: 73.08, speed: 15, timestamp });
+    assert.equal(staleLocation.status, 409);
+    assert.equal(staleLocation.data.code, 'STALE_LOCATION_UPDATE');
     const event = await update;
     assert.equal(event.busId, busA._id);
     assert.equal(event.latitude, 31.418);
@@ -564,11 +574,48 @@ test('existing GPS, real Socket.IO delivery, ETA, seats, bookings, routes and an
     assert.equal((await request('/api/bookings/' + booking.data._id + '/cancel', commuterToken, 'PATCH')).status, 200);
     assert.equal((await request('/api/buses/' + busA._id + '/seats')).data.available, 40);
     for (const path of ['/api/routes', '/api/routes/' + route._id, '/api/stops/route/' + route._id, '/api/route-alerts/route/' + route._id]) assert.equal((await request(path)).status, 200);
+    const overview = await request('/api/routes/overview');
+    assert.equal(overview.status, 200);
+    assert.match(overview.headers['cache-control'], /max-age=10/);
+    assert.ok(Array.isArray(overview.data));
+    assert.ok(overview.data.some((item) => item._id === route._id && Array.isArray(item.stops) && Array.isArray(item.buses)));
+    assert.equal((await request('/api/admin/routes-with-details')).status, 401);
+    const adminRoutes = await request('/api/admin/routes-with-details', adminToken);
+    assert.equal(adminRoutes.status, 200);
+    assert.ok(adminRoutes.data.some((item) => item._id === route._id && Array.isArray(item.stops) && Array.isArray(item.alerts)));
     for (const path of ['/api/admin/overview', '/api/admin/analytics/bookings', '/api/admin/analytics/occupancy', '/api/admin/analytics/reports', '/api/admin/shifts', '/api/reports']) assert.equal((await request(path, adminToken)).status, 200);
     assert.equal((await request('/api/bookings/me', commuterToken)).status, 200);
     assert.equal((await request('/api/safety/sessions/me', commuterToken)).status, 200);
+    assert.equal((await request('/api/passenger/bootstrap')).status, 401);
+    const bootstrap = await request('/api/passenger/bootstrap', commuterToken);
+    assert.equal(bootstrap.status, 200);
+    assert.ok(Array.isArray(bootstrap.data.routes));
+    assert.ok(Array.isArray(bootstrap.data.buses));
+    assert.ok(Array.isArray(bootstrap.data.bookings));
+    assert.ok(Array.isArray(bootstrap.data.activeBookings));
+    assert.ok(Array.isArray(bootstrap.data.routeAlerts));
+    assert.equal(typeof bootstrap.data.unreadAlerts, 'number');
+    assert.equal('password' in bootstrap.data.profile, false);
   } finally {
     socket.disconnect();
+  }
+});
+
+test('aggregate endpoints return empty route collections when no active routes exist', async () => {
+  await Route.updateOne({ _id: route._id }, { $set: { isActive: false } });
+  try {
+    const overview = await request('/api/routes/overview');
+    assert.equal(overview.status, 200);
+    assert.deepEqual(overview.data, []);
+    const adminRoutes = await request('/api/admin/routes-with-details', adminToken);
+    assert.equal(adminRoutes.status, 200);
+    assert.deepEqual(adminRoutes.data, []);
+    const passenger = await request('/api/passenger/bootstrap', commuterToken);
+    assert.equal(passenger.status, 200);
+    assert.deepEqual(passenger.data.routes, []);
+    assert.deepEqual(passenger.data.buses, []);
+  } finally {
+    await Route.updateOne({ _id: route._id }, { $set: { isActive: true } });
   }
 });
 

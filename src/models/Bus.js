@@ -30,6 +30,10 @@ const busSchema = new mongoose.Schema(
       type: Date,
       default: null,
     },
+    locationCapturedAt: {
+      type: Date,
+      default: null,
+    },
     status: {
       type: String,
       enum: ["active", "idle", "maintenance"],

@@ -7,7 +7,7 @@ const { ApiError, sendApiError } = require('../utils/apiError');
 const { assertObjectId, validateAccountFields } = require('../utils/accountValidation');
 const Report = require('../models/Report');
 const Shift = require('../models/Shift');
-const { getOperatingBusesForRoute } = require('../services/operatingBusService');
+const { getOperatingBusesForRoute, getOperatingBusesForBusIds } = require('../services/operatingBusService');
 const Seat = require('../models/Seat');
 
 // @route   GET /api/admin/overview
@@ -26,8 +26,7 @@ const getFleetOverview = async (req, res) => {
       Booking.countDocuments({}),
       Report.countDocuments({ status: 'open' }),
     ]);
-    const routeIds = await Shift.distinct('route', { status: 'active', endedAt: null });
-    const operatingBuses = (await Promise.all(routeIds.map(id => getOperatingBusesForRoute(id)))).flat();
+    const operatingBuses = await getOperatingBusesForBusIds(await Bus.distinct('_id'));
     const activeBuses = operatingBuses.length;
     const activeShifts = activeBuses;
     const idleBuses = Math.max(0, totalBuses - activeBuses - maintenanceBuses);
@@ -119,11 +118,11 @@ const getReportsSummary = async (req, res) => {
 
 const getShifts = async (req, res) => {
   try {
-    const shifts = await Shift.find({})
+    const shifts = await Shift.find({}).select('_id driver bus route startedAt endedAt heartbeatAt status startDirection createdAt updatedAt')
       .populate('driver', 'name email phone')
       .populate('bus', 'busNumber status direction')
       .populate('route', 'routeName startPoint endPoint')
-      .sort({ startedAt: -1 });
+      .sort({ startedAt: -1 }).lean();
     res.status(200).json(shifts);
   } catch (err) {
     sendApiError(res, err, 'Could not load shifts.');
@@ -136,8 +135,7 @@ const getOperatingConsistency = async (req, res) => {
       Bus.find({}).select('_id busNumber route driver status').lean(),
       Shift.find({ status: 'active', endedAt: null }).select('_id bus driver route startedAt heartbeatAt').lean(),
     ]);
-    const routeIds = [...new Set([...buses.map(b => String(b.route || '')), ...shifts.map(s => String(s.route || ''))].filter(Boolean))];
-    const operating = (await Promise.all(routeIds.map(id => getOperatingBusesForRoute(id)))).flat();
+    const operating = await getOperatingBusesForBusIds(buses.map((bus) => bus._id));
     const operatingByBus = new Set(operating.map(b => String(b._id)));
     const shiftByBus = new Map(shifts.map(s => [String(s.bus), s]));
     const mismatches = [];
@@ -169,12 +167,12 @@ const getAdminBookings = async (req, res) => {
     const filter = {};
     if (['confirmed', 'boarded', 'no_show', 'cancelled', 'cancelled_by_service', 'completed'].includes(req.query.status)) filter.status = req.query.status;
     if (['pending', 'paid', 'failed', 'cancelled'].includes(req.query.paymentStatus)) filter.paymentStatus = req.query.paymentStatus;
-    const bookings = await Booking.find(filter)
+    const bookings = await Booking.find(filter).select('_id user bus route driver shift seatNumber fare currency status paymentStatus paymentMethod paymentProvider createdAt paidAt')
       .populate('user', 'name email phone')
       .populate('bus', 'busNumber status availableSeats capacity')
       .populate('route', 'routeName startPoint endPoint')
       .populate('driver', 'name')
-      .sort({ createdAt: -1 }).limit(500);
+      .sort({ createdAt: -1 }).limit(500).lean();
     res.status(200).json(bookings);
   } catch (err) {
     sendApiError(res, err, 'Could not load bookings.');

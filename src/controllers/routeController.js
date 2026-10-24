@@ -1,4 +1,5 @@
 const Route = require('../models/Route');
+const { getRoutesOverviewData } = require('../services/routeOverviewService');
 const { ApiError, sendApiError } = require('../utils/apiError');
 const { assertObjectId, requireObjectBody } = require('../utils/accountValidation');
 
@@ -51,6 +52,16 @@ async function getRoutes(_req, res) {
   }
 }
 
+async function getRoutesOverview(_req, res) {
+  try {
+    const routes = await getRoutesOverviewData();
+    res.setHeader('Cache-Control', 'public, max-age=10, stale-while-revalidate=30');
+    return res.status(200).json(routes);
+  } catch (error) {
+    return sendApiError(res, error, 'Could not load route overview.');
+  }
+}
+
 async function getRouteById(req, res) {
   try {
     assertObjectId(req.params.id, 'Route ID');
@@ -86,4 +97,4 @@ async function deleteRoute(req, res) {
   }
 }
 
-module.exports = { createRoute, getRoutes, getRouteById, updateRoute, deleteRoute };
+module.exports = { createRoute, getRoutes, getRoutesOverview, getRouteById, updateRoute, deleteRoute };
