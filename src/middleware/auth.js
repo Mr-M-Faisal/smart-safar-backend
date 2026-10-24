@@ -15,11 +15,13 @@ const protect = async (req, res, next) => {
 
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET, { algorithms: ['HS256'] });
-    req.user = await User.findById(decoded.id).select('-password');
+    req.user = await User.findById(decoded.id).select('-password +googleId');
 
     if (!req.user) {
       return res.status(401).json({ message: 'Not authorized, user no longer exists' });
     }
+    if (req.user.isActive === false) return res.status(403).json({ message: 'This account has been disabled. Contact an administrator.', code: 'ACCOUNT_DISABLED' });
+    req.authSessionId = decoded.sid || null;
 
     next();
   } catch (err) {

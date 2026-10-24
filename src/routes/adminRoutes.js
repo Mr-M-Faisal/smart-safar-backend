@@ -13,7 +13,7 @@ const {
   updateCommuter,
 } = require('../controllers/adminController');
 const { protect, authorize } = require('../middleware/auth');
-const { getDrivers, createDriver, updateDriver, deleteDriver } = require('../controllers/adminDriverController');
+const { getDrivers, createDriver, updateDriver, deleteDriver, resetDriverPassword, setDriverStatus } = require('../controllers/adminDriverController');
 const { getAdminRoutesWithDetails } = require('../controllers/aggregateController');
 
 // Every route here is admin-only — this whole file is the dashboard's data layer
@@ -39,6 +39,8 @@ router.put('/users/:id', updateCommuter);
 router.get('/drivers', getDrivers);
 router.post('/drivers', createDriver);
 router.put('/drivers/:id', updateDriver);
+router.patch('/drivers/:id/password', resetDriverPassword);
+router.patch('/drivers/:id/status', setDriverStatus);
 router.delete('/drivers/:id', deleteDriver);
 
 module.exports = router;

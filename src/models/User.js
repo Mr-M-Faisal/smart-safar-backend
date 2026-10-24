@@ -5,9 +5,11 @@ const userSchema = new mongoose.Schema(
     {
     name: { type: String, required: true, trim: true },
     email: { type: String, required: true, unique: true, lowercase: true, trim: true },
-    password: { type: String, required: true, minlength: 6 },
+    password: { type: String, required: function requirePassword() { return !this.googleId; }, minlength: 6 },
+    googleId: { type: String, default: undefined, select: false },
     phone: { type: String, trim: true },
     role: { type: String, enum: ['commuter', 'driver', 'admin'], default: 'commuter' },
+    isActive: { type: Boolean, default: true },
     assignedBus: { type: mongoose.Schema.Types.ObjectId, ref: 'Bus', default: null },
   },
   { timestamps: true }
@@ -23,6 +25,7 @@ userSchema.pre('save', async function (next) {
 });
 
 userSchema.methods.matchPassword = async function (enteredPassword) {
+  if (!this.password) return false;
   return bcrypt.compare(enteredPassword, this.password);
 };
 

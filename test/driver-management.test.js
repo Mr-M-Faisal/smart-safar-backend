@@ -54,7 +54,7 @@ function paymentSignature(body) {
 }
 
 function assertSafeDriver(record) {
-  const allowed = ['_id', 'name', 'email', 'phone', 'role', 'assignedBus', 'createdAt', 'updatedAt'];
+  const allowed = ['_id', 'name', 'email', 'phone', 'role', 'assignedBus', 'isActive', 'createdAt', 'updatedAt'];
   assert.ok(Object.keys(record).every((key) => allowed.includes(key)));
   assert.equal(record.role, 'driver');
   assert.ok(record._id && record.email);
@@ -1094,4 +1094,86 @@ test('concurrent bus deletion and assignment cannot leave a dangling profile ass
   assert.equal(results[1].status, 200);
   assert.equal(await Bus.findById(busB._id), null);
   assert.equal((await profile(driverTokenA)).assignedBus, null);
+});
+
+test('profile editing validates fields, keeps email read-only, and password rotation revokes other sessions', async () => {
+  const email = 'profile-edit@integration.example';
+  const registered = await request('/api/auth/register', null, 'POST', { name: 'Profile Before', email, password, phone: '03001234567' });
+  assert.equal(registered.status, 201);
+  const another = await login(email);
+  const updated = await request('/api/auth/profile', registered.data.token, 'PATCH', { name: 'Profile Updated', phone: '+92 300 1234567' });
+  assert.equal(updated.status, 200);
+  assert.equal(updated.data.name, 'Profile Updated');
+  assert.equal(updated.data.phone, '+92 300 1234567');
+  assert.equal(updated.data.email, email);
+  assert.equal(Object.hasOwn(updated.data, 'password'), false);
+  assert.equal((await request('/api/auth/profile', registered.data.token, 'PATCH', { email: 'changed@integration.example' })).status, 400);
+  assert.equal((await request('/api/auth/profile', registered.data.token, 'PATCH', { name: ' ' })).status, 400);
+
+  const changed = await request('/api/auth/change-password', registered.data.token, 'POST', { currentPassword: password, newPassword: 'NewSecurePassword22' });
+  assert.equal(changed.status, 200);
+  assert.ok(changed.data.token && changed.data.refreshToken);
+  assert.equal((await request('/api/auth/profile', changed.data.token)).status, 200);
+  assert.equal((await request('/api/auth/refresh', null, 'POST', { refreshToken: registered.data.refreshToken })).status, 401);
+  assert.equal((await request('/api/auth/refresh', null, 'POST', { refreshToken: another.refreshToken })).status, 401);
+  assert.equal((await request('/api/auth/login', null, 'POST', { email, password })).status, 401);
+  assert.equal((await request('/api/auth/login', null, 'POST', { email, password: 'NewSecurePassword22' })).status, 200);
+  const wrong = await request('/api/auth/change-password', changed.data.token, 'POST', { currentPassword: password, newPassword: 'AnotherSecurePassword33' });
+  assert.equal(wrong.status, 400);
+  assert.equal(wrong.data.code, 'CURRENT_PASSWORD_INCORRECT');
+  const same = await request('/api/auth/change-password', changed.data.token, 'POST', { currentPassword: 'NewSecurePassword22', newPassword: 'NewSecurePassword22' });
+  assert.equal(same.data.code, 'PASSWORD_UNCHANGED');
+
+  for (let index = 0; index < 12; index += 1) {
+    const attempt = await request('/api/auth/change-password', changed.data.token, 'POST', { currentPassword: 'wrong-password', newPassword: 'DifferentPassword44' }, { 'X-Forwarded-For': '198.51.100.88' });
+    assert.equal(attempt.status, 400);
+  }
+  const limited = await request('/api/auth/change-password', changed.data.token, 'POST', { currentPassword: 'wrong-password', newPassword: 'DifferentPassword44' }, { 'X-Forwarded-For': '198.51.100.88' });
+  assert.equal(limited.status, 429);
+  assert.equal(limited.data.code, 'LOGIN_RATE_LIMITED');
+
+  const googleUser = await User.create({ name: 'Google Only', email: 'google-only@integration.example', googleId: 'provider-id-1', role: 'commuter' });
+  const { createSession } = require('../src/services/authSessionService');
+  const googleSession = await createSession(googleUser);
+  const googleChange = await request('/api/auth/change-password', googleSession.token, 'POST', { currentPassword: 'no-password', newPassword: 'GooglePassword55' });
+  assert.equal(googleChange.status, 400);
+  assert.equal(googleChange.data.code, 'PASSWORD_LOGIN_UNAVAILABLE');
+});
+
+test('admin can reset driver password and disable or re-enable sign-in', async () => {
+  const driver = await createDriver('driver-controls@integration.example', 'Driver Controls');
+  const firstSession = await login(driver.email);
+  const secondSession = await login(driver.email);
+  const reset = await request('/api/admin/drivers/' + driver._id + '/password', adminToken, 'PATCH', { newPassword: 'TemporaryDriverPassword66' });
+  assert.equal(reset.status, 204);
+  assert.equal((await request('/api/auth/refresh', null, 'POST', { refreshToken: firstSession.refreshToken })).status, 401);
+  assert.equal((await request('/api/auth/refresh', null, 'POST', { refreshToken: secondSession.refreshToken })).status, 401);
+  assert.equal((await request('/api/auth/login', null, 'POST', { email: driver.email, password })).status, 401);
+  const current = await login(driver.email, 'TemporaryDriverPassword66');
+  const disabled = await request('/api/admin/drivers/' + driver._id + '/status', adminToken, 'PATCH', { active: false });
+  assert.equal(disabled.status, 200);
+  assert.equal(disabled.data.isActive, false);
+  const loginDisabled = await request('/api/auth/login', null, 'POST', { email: driver.email, password: 'TemporaryDriverPassword66' });
+  assert.equal(loginDisabled.status, 403);
+  assert.equal(loginDisabled.data.code, 'ACCOUNT_DISABLED');
+  assert.equal((await request('/api/auth/profile', current.token)).data.code, 'ACCOUNT_DISABLED');
+  const refreshDisabled = await request('/api/auth/refresh', null, 'POST', { refreshToken: current.refreshToken });
+  assert.equal(refreshDisabled.status, 403);
+  assert.equal(refreshDisabled.data.code, 'ACCOUNT_DISABLED');
+  const enabled = await request('/api/admin/drivers/' + driver._id + '/status', adminToken, 'PATCH', { active: true });
+  assert.equal(enabled.status, 200);
+  assert.equal(enabled.data.isActive, true);
+  assert.equal((await login(driver.email, 'TemporaryDriverPassword66')).role, 'driver');
+  assert.equal((await request('/api/admin/drivers/' + driver._id + '/password', adminToken, 'PATCH', { newPassword: 'short' })).status, 400);
+  assert.equal((await request('/api/admin/drivers/' + driver._id + '/status', adminToken, 'PATCH', { active: 'false' })).status, 400);
+
+  const shiftDriver = await createDriver('driver-disable-shift@integration.example', 'Shift Driver');
+  const fleetBus = await request('/api/buses', adminToken, 'POST', { busNumber: 'SHIFT-CONTROL', route: route._id, capacity: 8, driver: shiftDriver._id });
+  assert.equal(fleetBus.status, 201);
+  const shiftIdentity = await login(shiftDriver.email);
+  assert.equal((await request('/api/buses/assigned/start-shift', shiftIdentity.token, 'POST')).status, 201);
+  const blockedDisable = await request('/api/admin/drivers/' + shiftDriver._id + '/status', adminToken, 'PATCH', { active: false });
+  assert.equal(blockedDisable.status, 409);
+  assert.equal(blockedDisable.data.code, 'SHIFT_OPEN');
+  assert.equal((await request('/api/buses/assigned/end-shift', shiftIdentity.token, 'POST')).status, 200);
 });
