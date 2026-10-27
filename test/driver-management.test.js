@@ -27,12 +27,20 @@ const password = crypto.randomBytes(18).toString('hex');
 let baseUrl, adminToken, commuter, commuterToken, driverA, driverB, driverTokenA, driverTokenB, route, busA, busB, routeFirstBooking;
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+let registrationClientCounter = 0;
+
 async function request(path, token, method = 'GET', body, extraHeaders = {}) {
+  // Registration is rate limited per client IP (8/hour). Each test registration simulates a different client
+  // so the suite does not trip the limiter; tests that exercise the limiter pass their own X-Forwarded-For.
+  const clientHeaders = path === '/api/auth/register' && method === 'POST' && !('X-Forwarded-For' in extraHeaders)
+    ? { 'X-Forwarded-For': `203.0.113.${(registrationClientCounter += 1) % 250 + 1}` }
+    : {};
   const response = await fetch(baseUrl + path, {
     method,
     headers: {
       'Content-Type': 'application/json',
       ...(token ? { Authorization: 'Bearer ' + token } : {}),
+      ...clientHeaders,
       ...extraHeaders,
     },
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
@@ -77,6 +85,17 @@ async function createDriver(email, name = 'Integration Driver') {
 
 async function assign(bus, driver) {
   return request('/api/buses/' + bus._id, adminToken, 'PUT', { driver: driver ? driver._id : null });
+}
+
+async function startShift(token) {
+  const result = await request('/api/buses/assigned/start-shift', token, 'POST');
+  assert.equal(result.status, 201);
+  return result;
+}
+
+// Assignment changes are rejected while a shift is open, so tests close any open shift before re-assigning.
+async function endShiftIfOpen(token) {
+  return request('/api/buses/assigned/end-shift', token, 'POST');
 }
 
 async function profile(token) {
@@ -152,10 +171,15 @@ test('normal commuter registration remains compatible', async () => {
   commuterToken = result.data.token;
 });
 
-test('route stop coordinates are constrained to Faisalabad and stop reads preserve journey order', async () => {
+test('route stop coordinates are constrained to Faisalabad and stop reads preserve journey order', async (t) => {
   const createdRoute = await request('/api/routes', adminToken, 'POST', { routeName: 'Coordinate Validation Route', startPoint: 'North', endPoint: 'South' });
   assert.equal(createdRoute.status, 201);
   const routeId = createdRoute.data._id;
+  // Remove this scratch route afterwards so "no active routes" tests are not affected by it.
+  t.after(async () => {
+    await Stop.deleteMany({ route: routeId });
+    await Route.deleteOne({ _id: routeId });
+  });
 
   const invalid = await request('/api/stops', adminToken, 'POST', { route: routeId, stopName: 'Outside Faisalabad', latitude: 21.4, longitude: 73.08, stopOrder: 1 });
   assert.equal(invalid.status, 400);
@@ -220,7 +244,8 @@ test('creation validates actual fields and rejects duplicate or privileged accou
   for (const body of [{ ...valid, name: ' ' }, { ...valid, email: 'invalid' }, { ...valid, password: 'short' }, { ...valid, phone: 123 }, { ...valid, role: 'admin' }, { ...valid, assignedBus: busA._id }]) {
     const result = await request('/api/admin/drivers', adminToken, 'POST', body);
     assert.equal(result.status, 400);
-    assert.deepEqual(Object.keys(result.data), ['message']);
+    assert.deepEqual(Object.keys(result.data).sort(), ['code', 'message', 'requestId']);
+    assert.equal(typeof result.data.message, 'string');
   }
   const duplicate = await request('/api/admin/drivers', adminToken, 'POST', { ...valid, email: ' DRIVER.A@INTEGRATION.EXAMPLE ' });
   assert.equal(duplicate.status, 409);
@@ -254,8 +279,8 @@ test('existing login supports admin-created drivers and rejects wrong passwords'
   driverTokenA = identityA.token;
   driverTokenB = identityB.token;
   const wrong = await request('/api/auth/login', null, 'POST', { email: driverA.email, password: password + 'wrong' });
-  assert.equal(wrong.status, 400);
-  assert.equal(wrong.data.message, 'Invalid credentials');
+  assert.equal(wrong.status, 401);
+  assert.equal(wrong.data.message, 'Invalid email or password.');
 });
 
 test('all driver management operations and assignment enforce database-backed admin authorization', async () => {
@@ -477,6 +502,8 @@ test('driver shifts are assigned-bus-only, persistent and safe under concurrent 
   assert.equal((await assign(busB, null)).status, 200);
   const missingRoute = await request('/api/buses/route/' + new mongoose.Types.ObjectId() + '/active');
   assert.deepEqual(missingRoute.data, []);
+  // Leave no open shift behind: later tests re-assign buses, which is rejected while a shift is open.
+  assert.equal((await request('/api/buses/assigned/end-shift', driverTokenA, 'POST')).status, 200);
 });
 
 test('return trip is assigned-driver-only, terminal-gated, atomic and direction-aware', async () => {
@@ -488,6 +515,7 @@ test('return trip is assigned-driver-only, terminal-gated, atomic and direction-
   assert.equal(noBus.data.message, 'No bus assigned.');
 
   assert.equal((await assign(busA, driverA)).status, 200);
+  await startShift(driverTokenA);
   await User.updateOne({ _id: driverB._id }, { $set: { assignedBus: busA._id } });
   const otherDriver = await request(endpoint, driverTokenB, 'POST');
   assert.equal(otherDriver.status, 403);
@@ -565,7 +593,9 @@ test('return trip is assigned-driver-only, terminal-gated, atomic and direction-
 });
 
 test('existing GPS, real Socket.IO delivery, ETA, seats, bookings, routes and analytics work after assignment', async () => {
+  await endShiftIfOpen(driverTokenA);
   assert.equal((await assign(busA, driverA)).status, 200);
+  await startShift(driverTokenA);
   const socket = createSocket(baseUrl, { transports: ['websocket'], reconnection: false, timeout: 5000 });
   try {
     await new Promise((resolve, reject) => { socket.once('connect', resolve); socket.once('connect_error', reject); });
@@ -648,7 +678,10 @@ test('aggregate endpoints return empty route collections when no active routes e
 });
 
 test('route-first and manual bookings resolve only valid active assignments and protect seats/payment state', async () => {
-  const seatsBefore = await Seat.countDocuments({ bus: busA._id, status: 'available' });
+  // Seats are created per shift, so count only the bus's current active shift.
+  const currentShift = await Shift.findOne({ bus: busA._id, status: 'active' });
+  assert.ok(currentShift, 'Bus A must have an active shift for route-first booking');
+  const seatsBefore = await Seat.countDocuments({ bus: busA._id, shift: currentShift._id, status: 'available' });
 
   const fakePaid = await request('/api/bookings', commuterToken, 'POST', {
     routeId: route._id,
@@ -1062,7 +1095,9 @@ test('ending a shift is atomic, disables GPS and preserves completed history', a
   const savedShift = await Shift.findById(success.shift._id);
   assert.equal(savedShift.status, 'completed');
   assert.ok(savedShift.endedAt);
-  assert.equal(await Shift.countDocuments({ driver: driverA._id }), 1);
+  // Ending the shift keeps exactly one record for it (completed, not duplicated) and leaves no active shift.
+  assert.equal(await Shift.countDocuments({ _id: success.shift._id }), 1);
+  assert.equal(await Shift.countDocuments({ driver: driverA._id, status: 'active' }), 0);
   assert.equal((await Bus.findById(busA._id)).status, 'idle');
   assert.equal((await Booking.findById(routeFirstBooking._id)).locationSharingActive, false);
   assert.equal((await Booking.findById(routeFirstBooking._id)).status, 'cancelled_by_service');
