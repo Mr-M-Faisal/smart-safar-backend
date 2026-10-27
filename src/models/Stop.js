@@ -4,8 +4,10 @@ const stopSchema = new mongoose.Schema(
   {
     route: { type: mongoose.Schema.Types.ObjectId, ref: 'Route', required: true },
     stopName: { type: String, required: true, trim: true, maxlength: 120 },
-    latitude: { type: Number, required: true, min: -90, max: 90 },
-    longitude: { type: Number, required: true, min: -180, max: 180 },
+    // Stops are only meaningful on the Faisalabad transit network. Keep
+    // persisted coordinates inside the same bounds used by the map client.
+    latitude: { type: Number, required: true, min: 30.9, max: 32.0 },
+    longitude: { type: Number, required: true, min: 72.6, max: 73.7 },
     stopOrder: { type: Number, required: true, min: 1, validate: Number.isInteger },
   },
   { timestamps: true }

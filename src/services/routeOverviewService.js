@@ -8,7 +8,7 @@ const routeOverviewPipeline = [
     from: 'stops',
     localField: '_id',
     foreignField: 'route',
-    pipeline: [{ $sort: { stopOrder: 1 } }, { $project: { stopName: 1, latitude: 1, longitude: 1, stopOrder: 1 } }],
+    pipeline: [{ $sort: { stopOrder: 1, _id: 1 } }, { $project: { stopName: 1, latitude: 1, longitude: 1, stopOrder: 1 } }],
     as: 'stops',
   } },
   { $lookup: {

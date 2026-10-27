@@ -10,7 +10,7 @@ async function getAdminRoutesWithDetails(_req, res) {
     const now = new Date();
     const routes = await Route.aggregate([
       { $match: { isActive: true } }, { $sort: { createdAt: -1 } },
-      { $lookup: { from: 'stops', localField: '_id', foreignField: 'route', pipeline: [{ $sort: { stopOrder: 1 } }], as: 'stops' } },
+      { $lookup: { from: 'stops', localField: '_id', foreignField: 'route', pipeline: [{ $sort: { stopOrder: 1, _id: 1 } }], as: 'stops' } },
       { $lookup: { from: 'routealerts', let: { routeId: '$_id' }, pipeline: [{ $match: { $expr: { $and: [ { $eq: ['$route', '$$routeId'] }, { $or: [ { $eq: ['$expiresAt', null] }, { $gt: ['$expiresAt', now] } ] } ] } } }, { $sort: { createdAt: -1 } }], as: 'alerts' } },
       { $project: { _id: 1, routeName: 1, startPoint: 1, endPoint: 1, description: 1, isActive: 1, stops: 1, alerts: 1 } },
     ]);

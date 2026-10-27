@@ -152,6 +152,34 @@ test('normal commuter registration remains compatible', async () => {
   commuterToken = result.data.token;
 });
 
+test('route stop coordinates are constrained to Faisalabad and stop reads preserve journey order', async () => {
+  const createdRoute = await request('/api/routes', adminToken, 'POST', { routeName: 'Coordinate Validation Route', startPoint: 'North', endPoint: 'South' });
+  assert.equal(createdRoute.status, 201);
+  const routeId = createdRoute.data._id;
+
+  const invalid = await request('/api/stops', adminToken, 'POST', { route: routeId, stopName: 'Outside Faisalabad', latitude: 21.4, longitude: 73.08, stopOrder: 1 });
+  assert.equal(invalid.status, 400);
+  assert.match(invalid.data.message, /Faisalabad service area/);
+
+  const later = await request('/api/stops', adminToken, 'POST', { route: routeId, stopName: 'Later stop', latitude: 31.43, longitude: 73.09, stopOrder: 2 });
+  const earlier = await request('/api/stops', adminToken, 'POST', { route: routeId, stopName: 'Earlier stop', latitude: 31.42, longitude: 73.08, stopOrder: 1 });
+  assert.equal(later.status, 201);
+  assert.equal(earlier.status, 201);
+  const duplicateOrder = await request('/api/stops', adminToken, 'POST', { route: routeId, stopName: 'Duplicate order', latitude: 31.44, longitude: 73.1, stopOrder: 1 });
+  assert.equal(duplicateOrder.status, 409);
+
+  const stopList = await request(`/api/stops/route/${routeId}`);
+  assert.deepEqual(stopList.data.map((stop) => stop.stopName), ['Earlier stop', 'Later stop']);
+  assert.equal(stopList.data[0].latitude, 31.42);
+  const overview = await request('/api/routes/overview');
+  const routeOverview = overview.data.find((item) => item._id === routeId);
+  assert.deepEqual(routeOverview.stops.map((stop) => stop.stopOrder), [1, 2]);
+  assert.equal(routeOverview.stops[0].longitude, 73.08);
+  const reordered = await request(`/api/stops/${earlier.data._id}/reorder`, adminToken, 'PATCH', { direction: 'down' });
+  assert.equal(reordered.status, 200);
+  assert.deepEqual(reordered.data.stops.map((stop) => stop.stopName), ['Later stop', 'Earlier stop']);
+});
+
 test('refresh token rotation restores sessions and explicit logout revokes refresh', async () => {
   const identity = await login(commuter.email);
   const rotated = await request('/api/auth/refresh', null, 'POST', { refreshToken: identity.refreshToken });
@@ -576,7 +604,7 @@ test('existing GPS, real Socket.IO delivery, ETA, seats, bookings, routes and an
     for (const path of ['/api/routes', '/api/routes/' + route._id, '/api/stops/route/' + route._id, '/api/route-alerts/route/' + route._id]) assert.equal((await request(path)).status, 200);
     const overview = await request('/api/routes/overview');
     assert.equal(overview.status, 200);
-    assert.match(overview.headers['cache-control'], /max-age=10/);
+    assert.match(overview.headers['cache-control'], /no-store/);
     assert.ok(Array.isArray(overview.data));
     assert.ok(overview.data.some((item) => item._id === route._id && Array.isArray(item.stops) && Array.isArray(item.buses)));
     assert.equal((await request('/api/admin/routes-with-details')).status, 401);
